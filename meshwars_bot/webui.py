@@ -117,6 +117,7 @@ def _destination_to_json(d: Destination) -> Dict[str, Any]:
         "send_after": d.send_after,
         "send_before": d.send_before,
         "timezone": d.timezone,
+        "schedule": dict(d.schedule),
     }
 
 
@@ -488,6 +489,18 @@ INDEX_HTML = """<!doctype html>
   .kinds, .nets { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 4px; }
   .kinds label, .nets label { font-weight: 400; color: var(--text); display: flex; align-items: center; gap: 4px; }
   .net-fallback { display: none; }
+  .schedule-rows { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .schedule-row { display: flex; align-items: center; gap: 10px; }
+  .schedule-row .kind-name { font-weight: 400; color: var(--text); min-width: 120px; }
+  .schedule-row input[type="time"] {
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-size: 13px;
+    background: #fff;
+    color: var(--text);
+  }
+  .schedule-row .schedule-status { color: var(--muted); font-style: italic; }
   table.status-table { border-collapse: collapse; width: 100%; }
   table.status-table td { padding: 4px 8px 4px 0; vertical-align: top; }
   table.status-table td.k { color: var(--muted); white-space: nowrap; }
@@ -599,6 +612,16 @@ INDEX_HTML = """<!doctype html>
 
   var schema = { transports: ["dryrun"], boards: ["mc", "mt"], kinds: [] };
   var netsAvailable = [];
+  // Fallback kind list, used only before /api/config has ever answered
+  // (schema.kinds is empty until then) -- matches config.py's KNOWN_KINDS
+  // as of this task. Once schema.kinds is populated it always wins, so
+  // this only matters for the very first render.
+  var DEFAULT_KINDS = ["daily_recap", "weekly_recap", "month_honors", "net_wrapup", "season_close"];
+  // The config currently loaded/saved -- kept so the status pane (which
+  // only receives pending counts / window state from /api/state) can
+  // still show each destination's configured per-kind schedule and
+  // timezone next to them, without a second round-trip to the server.
+  var lastConfig = null;
 
   function qs(id) { return document.getElementById(id); }
 
@@ -621,6 +644,7 @@ INDEX_HTML = """<!doctype html>
 
   function renderConfig(cfg) {
     schema = cfg.schema || schema;
+    lastConfig = cfg;
 
     qs("base_url").value = cfg.feed.base_url || "";
     qs("timeout_seconds").value = cfg.feed.timeout_seconds;
@@ -652,7 +676,7 @@ INDEX_HTML = """<!doctype html>
     dest = dest || {
       name: "", transport: schema.transports[0] || "dryrun", host: "", port: "",
       channel: "", board: schema.boards[0] || "mc", dry_run: true, text_budget: 150,
-      kinds: [], net_ids: [], send_after: "", send_before: "", timezone: ""
+      kinds: [], net_ids: [], send_after: "", send_before: "", timezone: "", schedule: {}
     };
 
     var card = document.createElement("div");
@@ -721,9 +745,60 @@ INDEX_HTML = """<!doctype html>
     windowWrap.appendChild(windowRow);
     var windowHint = document.createElement("p");
     windowHint.className = "hint";
-    windowHint.textContent = "send_after / send_before: 24h \"HH:MM\", e.g. \"08:00\" / \"22:00\" -- a window may wrap midnight (send_after later than send_before). timezone: IANA name, e.g. \"America/Boise\" -- blank uses the bot host's own local time. An announcement arriving outside the window is held and relayed at the first poll once inside it.";
+    windowHint.textContent = "send_after / send_before: 24h 'HH:MM', e.g. '08:00' / '22:00' -- a window may wrap midnight (send_after later than send_before). timezone: IANA name, e.g. 'America/Boise' -- blank uses the bot host's own local time. An announcement arriving outside the window is held and relayed at the first poll once inside it.";
     windowWrap.appendChild(windowHint);
     card.appendChild(windowWrap);
+
+    // Per-kind schedule (optional) -- separate from, and finer-grained
+    // than, the send window above: a specific local clock time for EACH
+    // announcement kind, set here in the browser, with no preset values.
+    // Blank (the default for every kind, always) means send immediately
+    // on poll, same as no schedule at all.
+    var tzInput = windowRow.querySelector('[data-field="timezone"]');
+    var scheduleWrap = document.createElement("div");
+    scheduleWrap.style.marginTop = "12px";
+    var scheduleLabel = document.createElement("label");
+    scheduleLabel.textContent = "per-kind schedule (optional -- blank means send immediately)";
+    scheduleWrap.appendChild(scheduleLabel);
+
+    var scheduleTzNote = document.createElement("p");
+    scheduleTzNote.className = "hint";
+    function refreshScheduleTzNote() {
+      var tz = tzInput.value.trim();
+      scheduleTzNote.textContent = "Times below are read in " +
+        (tz ? ("'" + tz + "'") : "the bot host's own local time (no timezone set above)") + ".";
+    }
+    tzInput.addEventListener("input", refreshScheduleTzNote);
+    refreshScheduleTzNote();
+    scheduleWrap.appendChild(scheduleTzNote);
+
+    var scheduleRows = document.createElement("div");
+    scheduleRows.className = "schedule-rows";
+    scheduleRows.setAttribute("data-field", "schedule");
+    (schema.kinds.length ? schema.kinds : DEFAULT_KINDS).forEach(function (kind) {
+      var row = document.createElement("div");
+      row.className = "schedule-row";
+      var kindLabel = document.createElement("span");
+      kindLabel.className = "kind-name";
+      kindLabel.textContent = kind;
+      var timeInput = document.createElement("input");
+      timeInput.type = "time";
+      timeInput.setAttribute("data-schedule-kind", kind);
+      timeInput.value = (dest.schedule && dest.schedule[kind]) ? dest.schedule[kind] : "";
+      var status = document.createElement("span");
+      status.className = "schedule-status";
+      function refreshStatus() {
+        status.textContent = timeInput.value ? "" : "send immediately";
+      }
+      timeInput.addEventListener("input", refreshStatus);
+      refreshStatus();
+      row.appendChild(kindLabel);
+      row.appendChild(timeInput);
+      row.appendChild(status);
+      scheduleRows.appendChild(row);
+    });
+    scheduleWrap.appendChild(scheduleRows);
+    card.appendChild(scheduleWrap);
 
     // Kinds
     var kindsWrap = document.createElement("div");
@@ -733,7 +808,7 @@ INDEX_HTML = """<!doctype html>
     var kindsRow = document.createElement("div");
     kindsRow.className = "kinds";
     kindsRow.setAttribute("data-field", "kinds");
-    (schema.kinds.length ? schema.kinds : ["daily_recap", "weekly_recap", "month_honors", "net_wrapup"]).forEach(function (kind) {
+    (schema.kinds.length ? schema.kinds : DEFAULT_KINDS).forEach(function (kind) {
       var lbl = document.createElement("label");
       var cb = document.createElement("input");
       cb.type = "checkbox";
@@ -872,7 +947,20 @@ INDEX_HTML = """<!doctype html>
         });
       }
 
-      out.push({
+      // Per-kind schedule: only kinds with a non-blank time are included
+      // at all -- a blank input means "send immediately", exactly as if
+      // the kind were absent from `schedule` entirely, so there is no
+      // reason to send it as an empty string. If every row is blank the
+      // whole `schedule` key is left off the payload (an empty mapping
+      // can't be written back out at all -- see configwrite.py), which is
+      // exactly the "no schedule configured" state on the next load too.
+      var scheduleObj = {};
+      card.querySelectorAll("[data-schedule-kind]").forEach(function (input) {
+        var v = input.value ? input.value.trim() : "";
+        if (v) scheduleObj[input.getAttribute("data-schedule-kind")] = v;
+      });
+
+      var destPayload = {
         name: val("name"),
         transport: val("transport"),
         host: val("host") || null,
@@ -886,7 +974,11 @@ INDEX_HTML = """<!doctype html>
         send_after: val("send_after") ? val("send_after").trim() || null : null,
         send_before: val("send_before") ? val("send_before").trim() || null : null,
         timezone: val("timezone") ? val("timezone").trim() || null : null
-      });
+      };
+      if (Object.keys(scheduleObj).length > 0) {
+        destPayload.schedule = scheduleObj;
+      }
+      out.push(destPayload);
     });
     return out;
   }
@@ -911,6 +1003,27 @@ INDEX_HTML = """<!doctype html>
     });
   }
 
+  // For the status pane: each destination's configured per-kind schedule
+  // times, if any, plus its timezone -- pulled from the config already
+  // loaded via /api/config (lastConfig), since /api/state only carries
+  // pending counts and window membership, not the schedule itself.
+  function destScheduleSummary(name) {
+    if (!lastConfig || !lastConfig.destinations) return "";
+    var destCfg = null;
+    for (var i = 0; i < lastConfig.destinations.length; i++) {
+      if (lastConfig.destinations[i].name === name) { destCfg = lastConfig.destinations[i]; break; }
+    }
+    if (!destCfg || !destCfg.schedule) return "";
+    var parts = [];
+    Object.keys(destCfg.schedule).sort().forEach(function (kind) {
+      var t = destCfg.schedule[kind];
+      if (t) parts.push(kind + "@" + t);
+    });
+    if (!parts.length) return "";
+    var tz = destCfg.timezone ? destCfg.timezone : "host local time";
+    return ", next scheduled sends: " + parts.join(", ") + " (" + tz + ")";
+  }
+
   function refreshState() {
     fetch("/api/state").then(function (r) { return r.json(); }).then(function (st) {
       qs("st-cursor").textContent = (st.cursor_since === null || st.cursor_since === undefined) ? "(none yet)" : st.cursor_since;
@@ -929,7 +1042,8 @@ INDEX_HTML = """<!doctype html>
         ? destNames.map(function (n) {
             var count = pendingCounts[n] || 0;
             var inWindow = windowStatus[n];
-            return n + ": " + count + " pending, " + (inWindow ? "in window" : "outside window");
+            return n + ": " + count + " pending, " + (inWindow ? "in window" : "outside window") +
+              destScheduleSummary(n);
           }).join("; ")
         : "(no destinations)";
 

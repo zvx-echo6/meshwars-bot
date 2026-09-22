@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from . import schedule
 from .config import Config, DEFAULT_TEXT_BUDGET, Destination, load_config
@@ -146,6 +146,7 @@ def run_once(
     status: Optional[BotStatus] = None,
     sinks_cache: Optional[SinkCache] = None,
     now: Optional[datetime.datetime] = None,
+    schedule_conflict_warnings: Optional[Set[Tuple[str, str]]] = None,
 ) -> int:
     """Run a single poll -> route -> send -> persist cycle.
 
@@ -175,10 +176,23 @@ def run_once(
     run_once() once in isolation.
 
     `now`, when given, is the timezone-aware instant used to evaluate every
-    destination's send window (see schedule.in_window()) and to decide
-    what drains this cycle -- purely for deterministic tests; production
-    always omits it and gets the real current time.
+    destination's send window (see schedule.in_window()), every kind's
+    scheduled time (see schedule.is_kind_due()), and to decide what drains
+    this cycle -- purely for deterministic tests; production always omits
+    it and gets the real current time.
+
+    `schedule_conflict_warnings`, when given, is a set of (destination
+    name, kind) pairs the caller keeps across cycles so the "scheduled
+    time falls outside the send window" misconfiguration warning (see
+    schedule.schedule_conflicts_with_window()) is logged only the FIRST
+    time it's seen for a given destination+kind, not once every poll --
+    same pattern as run_cycle()'s `ff_tracker`. Pass the SAME set on every
+    call for that de-duplication to actually happen; a fresh one each call
+    (the default when omitted) re-warns every cycle.
     """
+    if schedule_conflict_warnings is None:
+        schedule_conflict_warnings = set()
+
     budget_groups = _group_destinations_by_budget(config)
 
     if sinks_cache is None:
@@ -262,23 +276,36 @@ def run_once(
                 )
 
     # --- Drain phase ---------------------------------------------------------
-    # For every destination currently inside its send window (or with no
-    # window configured, which is always "inside"), relay its pending
-    # items oldest-id-first, stopping at the first failure so a transient
-    # send failure retries the SAME item next cycle rather than skipping
-    # ahead and reordering. This runs for every configured destination, not
-    # just ones that got a new announcement this cycle, so a destination
-    # with nothing new but an existing backlog still drains the moment its
-    # window opens -- and pacing between sends is whatever the sink itself
-    # already enforces (see sinks._PacedRealSink._pace()), since each item
-    # still goes through one sink.send() call at a time, exactly as before.
+    # Relay each destination's pending items oldest-id-first. Two
+    # independent gates decide whether a given item is due RIGHT NOW:
+    #   - schedule.is_kind_due(): has the item's OWN kind's scheduled clock
+    #     time (if any -- most kinds have none, and are always due) been
+    #     reached in this destination's local time?
+    #   - schedule.in_window(): is `now` inside this destination's coarser
+    #     send_after/send_before quiet-hours window (if any)?
+    # A kind with no scheduled time and a destination with no window both
+    # default to "always true" -- so with neither configured, behaviour is
+    # exactly today's: relay immediately. When only one kind on a
+    # destination has a scheduled time, every OTHER kind is unaffected and
+    # still drains as soon as it's queued -- see the per-ITEM check below;
+    # a not-yet-due item is skipped (not a `break`), so a later, unrelated,
+    # already-due item in the same pending list still goes out this cycle.
+    # A `break` is reserved for an ACTUAL send failure, so a transient
+    # transport failure still retries the SAME item next cycle rather than
+    # skipping ahead and reordering -- exactly as before.
+    #
+    # If a kind's scheduled time can never satisfy the window at all (a
+    # structural misconfiguration -- see schedule.schedule_conflicts_with_
+    # window()), that item is held forever rather than guessing which of
+    # the two the operator actually meant: the window wins, and a warning
+    # is logged once (via `schedule_conflict_warnings`, deduped across
+    # cycles) naming both the schedule time and the window so it's fixed
+    # rather than silently never sent.
     if now is None:
         now = datetime.datetime.now(datetime.timezone.utc)
     for destination in config.destinations:
         pending = state.pending.get(destination.name)
         if not pending:
-            continue
-        if not schedule.in_window(destination, now):
             continue
         sink = sinks[destination.name]
         for item in sorted(pending, key=lambda p: p.id):
@@ -288,6 +315,30 @@ def run_once(
                 # never resend -- just drop the stale duplicate.
                 state.remove_pending(destination.name, item.id)
                 continue
+
+            if schedule.schedule_conflicts_with_window(destination, item.kind):
+                warn_key = (destination.name, item.kind)
+                if warn_key not in schedule_conflict_warnings:
+                    logger.warning(
+                        "destination=%s kind=%s: scheduled time %s can never fall "
+                        "inside the configured send window (send_after=%s, "
+                        "send_before=%s) -- this is a misconfiguration; the window "
+                        "wins, so announcements of this kind will stay pending "
+                        "forever until the config is fixed",
+                        destination.name,
+                        item.kind,
+                        destination.schedule.get(item.kind),
+                        destination.send_after,
+                        destination.send_before,
+                    )
+                    schedule_conflict_warnings.add(warn_key)
+                continue
+
+            if not schedule.is_kind_due(destination, item.kind, now):
+                continue  # this kind's scheduled time hasn't arrived yet
+            if not schedule.in_window(destination, now):
+                continue  # coarser window still holds it, even though due
+
             sent_ok = sink.send(item.text)
             if sent_ok:
                 state.mark_sent(destination.name, item.id)
@@ -423,6 +474,7 @@ def run_cycle(
     status: Optional[BotStatus] = None,
     ff_tracker: Optional[Dict[str, bool]] = None,
     sinks_cache: Optional[SinkCache] = None,
+    schedule_conflict_warnings: Optional[Set[Tuple[str, str]]] = None,
 ) -> int:
     """Run one iteration of the main loop.
 
@@ -444,6 +496,10 @@ def run_cycle(
     `sinks_cache` is passed straight through to `run_once()` -- see its
     docstring. Pass the SAME `SinkCache` instance on every call across the
     loop's lifetime for sinks to actually be reused between cycles.
+
+    `schedule_conflict_warnings` is passed straight through to
+    `run_once()` -- see its docstring. Pass the SAME set on every call for
+    its once-per-destination+kind de-duplication to work across cycles.
 
     Returns the number of seconds the caller should sleep before the next
     cycle.
@@ -492,7 +548,14 @@ def run_cycle(
 
     if status is not None:
         status.update(has_safe_cursor=True)
-    return run_once(config, state, feed_client, status=status, sinks_cache=sinks_cache)
+    return run_once(
+        config,
+        state,
+        feed_client,
+        status=status,
+        sinks_cache=sinks_cache,
+        schedule_conflict_warnings=schedule_conflict_warnings,
+    )
 
 
 def _reload_config(config_path: str, previous: Config) -> Config:
@@ -671,6 +734,11 @@ def main(argv=None) -> int:
             return 0
 
         ff_tracker = {"failed": False}
+        # One set for the lifetime of the process -- see run_once()'s
+        # `schedule_conflict_warnings` docstring: this is what makes the
+        # "scheduled time can never fall inside the send window" warning
+        # log once per destination+kind instead of once every poll cycle.
+        schedule_conflict_warnings: Set[Tuple[str, str]] = set()
         while True:
             # Re-read the config file at the top of EVERY cycle, rather
             # than once at startup, so a config saved through the web UI
@@ -688,7 +756,13 @@ def main(argv=None) -> int:
             )
 
             sleep_seconds = run_cycle(
-                config, state, feed_client, status=status, ff_tracker=ff_tracker, sinks_cache=sinks_cache
+                config,
+                state,
+                feed_client,
+                status=status,
+                ff_tracker=ff_tracker,
+                sinks_cache=sinks_cache,
+                schedule_conflict_warnings=schedule_conflict_warnings,
             )
             time.sleep(sleep_seconds)
     except KeyboardInterrupt:

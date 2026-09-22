@@ -254,6 +254,110 @@ class TestSendWindowValidation(unittest.TestCase):
         self.assertIn("timezone", str(ctx.exception))
 
 
+class TestKindScheduleValidation(unittest.TestCase):
+    """Per-destination, per-kind `schedule` mapping -- a separate, finer-
+    grained mechanism from send_after/send_before (see schedule.py). Every
+    entry optional; absent entirely means every kind relays immediately,
+    exactly as an existing config with no `schedule` key at all."""
+
+    def test_absent_schedule_defaults_to_empty(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].schedule, {})
+
+    def test_valid_schedule_entries_are_kept(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {
+            "daily_recap": "09:00",
+            "weekly_recap": "10:00",
+        }
+        config = build_config(raw)
+        self.assertEqual(
+            config.destinations[0].schedule,
+            {"daily_recap": "09:00", "weekly_recap": "10:00"},
+        )
+
+    def test_empty_string_entry_means_immediate_and_is_dropped(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"daily_recap": "09:00", "net_wrapup": ""}
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].schedule, {"daily_recap": "09:00"})
+
+    def test_null_entry_means_immediate_and_is_dropped(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"daily_recap": "09:00", "net_wrapup": None}
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].schedule, {"daily_recap": "09:00"})
+
+    def test_season_close_is_a_known_schedulable_kind(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"season_close": "11:00"}
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].schedule, {"season_close": "11:00"})
+
+    def test_unknown_kind_raises_naming_destination_and_kind(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"not_a_real_kind": "09:00"}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("not_a_real_kind", str(ctx.exception))
+
+    def test_bad_hhmm_raises_naming_destination_and_kind(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"daily_recap": "9am"}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("daily_recap", str(ctx.exception))
+
+    def test_out_of_range_hhmm_raises_naming_destination_and_kind(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"weekly_recap": "24:00"}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("weekly_recap", str(ctx.exception))
+
+    def test_non_string_value_raises_naming_destination_and_kind(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = {"daily_recap": 900}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("daily_recap", str(ctx.exception))
+
+    def test_schedule_must_be_a_mapping(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["schedule"] = ["daily_recap"]
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+
+    def test_nested_schedule_mapping_parses_inside_a_destination(self):
+        # The one nesting exception this repo's hand-rolled YAML subset
+        # parser allows inside a sequence item -- see config.py's
+        # parse_yaml_subset docstring and _parse_sequence.
+        text = """
+destinations:
+  - name: "d1"
+    transport: "dryrun"
+    board: "mc"
+    kinds: ["daily_recap"]
+    net_ids: []
+    schedule:
+      daily_recap: "09:00"
+      weekly_recap: "10:00"
+    timezone: "America/Boise"
+"""
+        raw = parse_yaml_subset(text)
+        self.assertEqual(
+            raw["destinations"][0]["schedule"],
+            {"daily_recap": "09:00", "weekly_recap": "10:00"},
+        )
+        self.assertEqual(raw["destinations"][0]["timezone"], "America/Boise")
+
+
 class TestMultiBudgetWarning(unittest.TestCase):
     """BUG 1's rate-limit consequence: config.py must warn (not error) when
     a config has more than one distinct text_budget and no feed.api_key --

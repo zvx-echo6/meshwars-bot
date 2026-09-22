@@ -132,6 +132,76 @@ class TestRoundTrip(unittest.TestCase):
         self.assertNotIn("    send_before:", text)
         self.assertNotIn("    timezone:", text)
 
+    def test_schedule_field_round_trips(self):
+        raw = {
+            "destinations": [
+                {
+                    "name": "d1",
+                    "timezone": "America/Boise",
+                    "schedule": {
+                        "daily_recap": "09:00",
+                        "weekly_recap": "10:00",
+                        "month_honors": "10:00",
+                    },
+                }
+            ]
+        }
+        self._assert_round_trips(raw)
+
+    def test_schedule_field_absent_stays_absent(self):
+        raw = {"destinations": [{"name": "d1", "dry_run": True}]}
+        text = write_config_text(raw)
+        self.assertNotIn("    schedule:", text)
+
+    def test_schedule_alongside_send_window_round_trips(self):
+        raw = {
+            "destinations": [
+                {
+                    "name": "d1",
+                    "send_after": "08:00",
+                    "send_before": "22:00",
+                    "timezone": "America/Boise",
+                    "schedule": {"daily_recap": "09:00"},
+                }
+            ]
+        }
+        self._assert_round_trips(raw)
+
+    def test_full_config_with_multiple_destinations_and_schedules_round_trips(self):
+        raw = {
+            "feed": {"base_url": "https://meshwars.com", "api_key": "", "timeout_seconds": 20},
+            "destinations": [
+                {
+                    "name": "mwmesh-mc",
+                    "transport": "meshcore",
+                    "board": "mc",
+                    "kinds": ["daily_recap", "net_wrapup", "season_close"],
+                    "net_ids": [1],
+                    "timezone": "America/Boise",
+                    "schedule": {"daily_recap": "09:00", "season_close": "11:30"},
+                },
+                {
+                    "name": "mwmesh-mt",
+                    "transport": "meshtastic",
+                    "board": "mt",
+                    "kinds": ["daily_recap"],
+                    "net_ids": [],
+                },
+            ],
+        }
+        self._assert_round_trips(raw)
+
+
+class TestEmptyScheduleMapping(unittest.TestCase):
+    """Same reasoning as TestEmptyMappingSections -- an empty `schedule`
+    mapping cannot round-trip in this YAML subset (no flow-mapping
+    support), so it must fail loudly rather than silently write something
+    that reads back as None instead of {}."""
+
+    def test_empty_schedule_dict_raises(self):
+        with self.assertRaises(ConfigWriteError):
+            write_config_text({"destinations": [{"name": "d1", "schedule": {}}]})
+
 
 class TestUnsafeValues(unittest.TestCase):
     def test_double_quote_in_value_raises(self):

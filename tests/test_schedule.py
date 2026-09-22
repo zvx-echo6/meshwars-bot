@@ -2,8 +2,8 @@ import datetime
 import os
 import sys
 import unittest
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,6 +17,7 @@ class FakeDestination:
     send_after: Optional[str] = None
     send_before: Optional[str] = None
     timezone: Optional[str] = None
+    schedule: Dict[str, str] = field(default_factory=dict)
 
 
 def _utc(hour, minute, month=6, day=15, year=2026):
@@ -122,6 +123,85 @@ class TestInWindowTimezone(unittest.TestCase):
         dest = FakeDestination(send_after="00:00", send_before="23:59")
         result = schedule.in_window(dest, _utc(12, 0))
         self.assertIsInstance(result, bool)
+
+
+class TestIsKindDue(unittest.TestCase):
+    """Per-kind scheduled send time -- a separate, finer-grained mechanism
+    from the send window above (see schedule.py's module docstring)."""
+
+    def test_no_schedule_at_all_is_always_due(self):
+        dest = FakeDestination()
+        self.assertTrue(schedule.is_kind_due(dest, "daily_recap", _utc(0, 0)))
+        self.assertTrue(schedule.is_kind_due(dest, "daily_recap", _utc(23, 59)))
+
+    def test_kind_not_in_schedule_is_always_due(self):
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="UTC")
+        # net_wrapup has no entry -- unaffected by daily_recap's schedule.
+        self.assertTrue(schedule.is_kind_due(dest, "net_wrapup", _utc(3, 0)))
+
+    def test_kind_with_no_kind_argument_is_always_due(self):
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="UTC")
+        self.assertTrue(schedule.is_kind_due(dest, None, _utc(3, 0)))
+
+    def test_before_scheduled_time_is_not_due(self):
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="UTC")
+        self.assertFalse(schedule.is_kind_due(dest, "daily_recap", _utc(8, 59)))
+
+    def test_at_scheduled_time_is_due(self):
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="UTC")
+        self.assertTrue(schedule.is_kind_due(dest, "daily_recap", _utc(9, 0)))
+
+    def test_after_scheduled_time_is_due(self):
+        # An item first checked well after its scheduled clock time (e.g.
+        # it arrived late, or this is a later poll) is due immediately --
+        # no memory of "when did this first arrive" is needed or kept.
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="UTC")
+        self.assertTrue(schedule.is_kind_due(dest, "daily_recap", _utc(20, 0)))
+
+    def test_empty_string_schedule_entry_is_always_due(self):
+        dest = FakeDestination(schedule={"net_wrapup": ""}, timezone="UTC")
+        self.assertTrue(schedule.is_kind_due(dest, "net_wrapup", _utc(0, 0)))
+
+    def test_honours_destination_timezone(self):
+        # 09:00 America/Boise (Mountain, UTC-6 in June DST) is 15:00 UTC.
+        dest = FakeDestination(schedule={"daily_recap": "09:00"}, timezone="America/Boise")
+        self.assertFalse(schedule.is_kind_due(dest, "daily_recap", _utc(14, 59)))
+        self.assertTrue(schedule.is_kind_due(dest, "daily_recap", _utc(15, 0)))
+
+
+class TestScheduleConflictsWithWindow(unittest.TestCase):
+    """The structural misconfiguration schedule_conflicts_with_window()
+    exists to detect: a kind's scheduled clock time that can never fall
+    inside the destination's coarser send window."""
+
+    def test_no_schedule_for_kind_never_conflicts(self):
+        dest = FakeDestination(send_after="08:00", send_before="09:00", timezone="UTC")
+        self.assertFalse(schedule.schedule_conflicts_with_window(dest, "daily_recap"))
+
+    def test_no_window_never_conflicts_even_with_a_schedule(self):
+        dest = FakeDestination(schedule={"daily_recap": "23:00"}, timezone="UTC")
+        self.assertFalse(schedule.schedule_conflicts_with_window(dest, "daily_recap"))
+
+    def test_schedule_inside_window_does_not_conflict(self):
+        dest = FakeDestination(
+            send_after="08:00", send_before="22:00", timezone="UTC",
+            schedule={"daily_recap": "09:00"},
+        )
+        self.assertFalse(schedule.schedule_conflicts_with_window(dest, "daily_recap"))
+
+    def test_schedule_outside_window_conflicts(self):
+        dest = FakeDestination(
+            send_after="08:00", send_before="09:30", timezone="UTC",
+            schedule={"daily_recap": "10:00"},
+        )
+        self.assertTrue(schedule.schedule_conflicts_with_window(dest, "daily_recap"))
+
+    def test_none_kind_never_conflicts(self):
+        dest = FakeDestination(
+            send_after="08:00", send_before="09:30", timezone="UTC",
+            schedule={"daily_recap": "10:00"},
+        )
+        self.assertFalse(schedule.schedule_conflicts_with_window(dest, None))
 
 
 if __name__ == "__main__":

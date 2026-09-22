@@ -19,8 +19,13 @@ subset, is:
           port: 1
         - name: "b"
           port: 2
-  A sequence item may itself only be a flat mapping of scalars / inline
-  lists — it may NOT contain a further nested mapping or sequence.
+  A sequence item's fields are normally scalars / inline lists only, with
+  ONE narrow exception: a field whose value is a nested block mapping is
+  allowed (e.g. a destination's `schedule:` sub-mapping of kind -> "HH:MM",
+  see Destination.schedule / _validate_schedule below) -- parsed by the
+  same general `_parse_mapping` the rest of this parser uses, so it may
+  itself nest arbitrarily deep. A sequence item may NOT contain a further
+  nested SEQUENCE, though (no list-of-lists, no list-in-a-list-item).
   Sequences of bare scalars (`- foo`) are NOT supported.
 - Inline flow sequences of scalars only, e.g. `kinds: ["a", "b"]` or
   `net_ids: [1, 2]`. No nested flow lists and no flow mappings (`{...}`).
@@ -204,8 +209,25 @@ def _parse_sequence(tokens: List[tuple], idx: int, indent: int):
             k, _, v = kcontent.partition(":")
             k = k.strip()
             v = v.strip()
-            item[k] = None if v == "" else _parse_value(v, klineno)
             idx += 1
+            if v != "":
+                item[k] = _parse_value(v, klineno)
+                continue
+            # Blank value: either None, or -- the one nesting exception
+            # this parser allows inside a sequence item -- a nested block
+            # mapping (e.g. a destination's `schedule:` sub-mapping). A
+            # nested SEQUENCE here is still rejected: only a mapping.
+            if idx < len(tokens) and tokens[idx][0] > item_col:
+                if tokens[idx][1].startswith("- "):
+                    raise ConfigError(
+                        f"line {tokens[idx][2]}: nested sequences inside a "
+                        "sequence item are not supported"
+                    )
+                nested_indent = tokens[idx][0]
+                nested_value, idx = _parse_mapping(tokens, idx, nested_indent)
+                item[k] = nested_value
+            else:
+                item[k] = None
         result.append(item)
     return result, idx
 
@@ -242,7 +264,13 @@ KNOWN_BOARDS = set(_BOARD_ALIASES)
 
 # The announcement kinds documented for this bot as of this task. Extend this
 # set (honestly) if the feed grows more kinds.
-KNOWN_KINDS = {"daily_recap", "weekly_recap", "month_honors", "net_wrapup"}
+KNOWN_KINDS = {"daily_recap", "weekly_recap", "month_honors", "net_wrapup", "season_close"}
+
+# The subset of KNOWN_KINDS a per-destination `schedule:` mapping may name.
+# Currently every known kind is schedulable, so this is just KNOWN_KINDS --
+# kept as its own name so a future kind that must NOT be schedulable (e.g.
+# something inherently instantaneous) has somewhere honest to diverge.
+SCHEDULABLE_KINDS = KNOWN_KINDS
 
 # Strict 24h "HH:MM" -- hours 00-23, minutes 00-59. Used to validate the
 # optional per-destination send_after/send_before window bounds (see
@@ -297,6 +325,19 @@ class Destination:
     send_after: Optional[str] = None
     send_before: Optional[str] = None
     timezone: Optional[str] = None
+    # Optional per-kind scheduled send time -- see schedule.py's
+    # is_kind_due(). Maps announcement kind -> validated "HH:MM" string.
+    # A kind with no entry here (the common case -- every entry is
+    # optional) means "send immediately on poll", exactly today's
+    # behaviour; an entry only ever exists for a kind whose configured
+    # value was a real, non-empty "HH:MM" string (empty string is
+    # normalized away during validation, see _validate_schedule). This is
+    # a SEPARATE, finer-grained mechanism from send_after/send_before
+    # above -- that pair is a single coarse quiet-hours window applying to
+    # EVERY kind; this is a per-kind clock time. Both can be set at once;
+    # schedule.py documents precedence (the window can still hold a
+    # kind's scheduled item further; the window wins on conflict).
+    schedule: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -394,6 +435,7 @@ def _build_destination(raw: Dict[str, Any], index: int) -> Destination:
     send_after = _validate_hhmm(raw.get("send_after"), name, "send_after")
     send_before = _validate_hhmm(raw.get("send_before"), name, "send_before")
     timezone = _validate_timezone(raw.get("timezone"), name)
+    schedule = _validate_schedule(raw.get("schedule"), name)
 
     return Destination(
         name=name,
@@ -409,6 +451,7 @@ def _build_destination(raw: Dict[str, Any], index: int) -> Destination:
         send_after=send_after,
         send_before=send_before,
         timezone=timezone,
+        schedule=schedule,
     )
 
 
@@ -424,6 +467,45 @@ def _validate_hhmm(value: Any, dest_name: str, field_name: str) -> Optional[str]
             f"string (e.g. \"08:00\"), got {value!r}"
         )
     return value.strip()
+
+
+def _validate_schedule(value: Any, dest_name: str) -> Dict[str, str]:
+    """Validate an optional per-destination `schedule` mapping: announcement
+    kind -> a local send time for that kind (see schedule.py's
+    is_kind_due()). None (absent -- the common case for an existing config,
+    which must be read completely unchanged) returns {}.
+
+    Every entry is optional and independent: a kind missing from the
+    mapping, or present with an empty string, means "send immediately on
+    poll" -- exactly today's behaviour -- so only non-empty entries are
+    kept in the returned dict. Anything else must be a strict 24h "HH:MM"
+    string, else ConfigError naming BOTH the destination and the kind (not
+    just the destination -- with up to five independent kinds here, "which
+    one" matters as much as "which destination").
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"destination '{dest_name}': 'schedule' must be a mapping of "
+            "kind -> \"HH:MM\" (e.g. {daily_recap: \"09:00\"})"
+        )
+    result: Dict[str, str] = {}
+    for kind, hhmm in value.items():
+        if kind not in SCHEDULABLE_KINDS:
+            raise ConfigError(
+                f"destination '{dest_name}': schedule has unknown kind {kind!r} "
+                f"(known: {sorted(SCHEDULABLE_KINDS)})"
+            )
+        if hhmm is None or (isinstance(hhmm, str) and hhmm.strip() == ""):
+            continue  # absent/empty -- send immediately, the default
+        if not isinstance(hhmm, str) or not _HHMM_RE.match(hhmm.strip()):
+            raise ConfigError(
+                f"destination '{dest_name}': schedule['{kind}'] must be a 24h "
+                f"\"HH:MM\" string (e.g. \"09:00\"), got {hhmm!r}"
+            )
+        result[kind] = hhmm.strip()
+    return result
 
 
 def _validate_timezone(value: Any, dest_name: str) -> Optional[str]:

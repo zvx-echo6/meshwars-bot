@@ -161,8 +161,15 @@ _DESTINATIONS_HEADER_COMMENT = [
     "  inside the window. A window may wrap midnight (send_after later than",
     "  send_before, e.g. \"22:00\"/\"06:00\").",
     "timezone: IANA zone name (e.g. \"America/Boise\") send_after/send_before",
-    "  are interpreted in. Absent -- defaults to the bot host's own local",
-    "  timezone.",
+    "  (and schedule, below) are interpreted in. Absent -- defaults to the",
+    "  bot host's own local timezone.",
+    "schedule: optional per-KIND scheduled send time (24h \"HH:MM\"), a",
+    "  separate, finer-grained setting from send_after/send_before above.",
+    "  Every kind is independent and optional -- a kind absent here, or",
+    "  given as an empty string, means send immediately on poll, exactly",
+    "  as if schedule weren't set at all. If a kind's scheduled time falls",
+    "  outside send_after/send_before, the window wins and that kind's",
+    "  announcements are held forever -- a warning is logged once for it.",
 ]
 
 # Destination field order, matching config.example.yaml, with a short
@@ -181,7 +188,8 @@ _DESTINATION_FIELD_ORDER = [
     ("net_ids", "opt-in net allow-list -- [] means no net announcements"),
     ("send_after", "HH:MM 24h -- hold until this local time; absent = relay immediately"),
     ("send_before", "HH:MM 24h -- hold after this local time"),
-    ("timezone", "IANA zone for send_after/send_before; absent = host local time"),
+    ("timezone", "IANA zone for send_after/send_before/schedule; absent = host local time"),
+    ("schedule", None),  # nested mapping -- rendered as a block, see _write_destination
 ]
 
 
@@ -205,6 +213,39 @@ def _write_known_fields(
     return out
 
 
+def _write_destination_field(
+    out: List[str], key: str, value: Any, prefix: str, short_comment: Optional[str]
+) -> None:
+    """Emit one destination field line. Every field is a scalar/inline-list
+    EXCEPT `schedule`, a nested mapping (kind -> "HH:MM") -- the one field
+    on a destination that needs the sequence-item nested-mapping exception
+    documented in config.py's parser docstring, rendered here as its own
+    small indented block rather than going through `_render_value` (which
+    still correctly refuses a flow-style `{...}` for every OTHER field,
+    since this YAML subset has no flow-mapping support at all).
+    """
+    comment_suffix = f"   # {short_comment}" if short_comment else ""
+    if not isinstance(value, dict):
+        out.append(f"{prefix}{key}: {_render_value(value)}" + comment_suffix)
+        return
+    if not value:
+        # Same reasoning as the empty feed/web dict case in
+        # write_config_text() below: a blank `key:` line reads back as
+        # None, not `{}` -- there is no way to write an empty mapping that
+        # round-trips in this YAML subset (no flow-mapping support). Fail
+        # loudly rather than silently writing something that reads back
+        # differently. Callers (webui.py) should omit an empty `schedule`
+        # key entirely instead of passing `{}`.
+        raise ConfigWriteError(
+            f"destination field '{key}' is present but empty -- cannot round-trip "
+            "an empty mapping in this YAML subset"
+        )
+    out.append(f"{prefix}{key}:" + comment_suffix)
+    nested_indent = " " * (len(prefix) + 2)
+    for k, v in value.items():
+        out.append(f"{nested_indent}{k}: {_render_value(v)}")
+
+
 def _write_destination(out: List[str], dest: Dict[str, Any]) -> None:
     name = dest.get("name", "")
     out.append(f"  # --- {name} ---" if name else "  # ---")
@@ -215,12 +256,12 @@ def _write_destination(out: List[str], dest: Dict[str, Any]) -> None:
             continue
         prefix = "  - " if first else "    "
         first = False
-        out.append(f"{prefix}{key}: {_render_value(dest[key])}" + (f"   # {short_comment}" if short_comment else ""))
+        _write_destination_field(out, key, dest[key], prefix, short_comment)
         del remaining[key]
     for key, value in remaining.items():
         prefix = "  - " if first else "    "
         first = False
-        out.append(f"{prefix}{key}: {_render_value(value)}")
+        _write_destination_field(out, key, value, prefix, None)
 
 
 def write_config_text(raw: Dict[str, Any]) -> str:
