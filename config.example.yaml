@@ -24,6 +24,16 @@ feed:
 # first-run "fast-forward, send nothing" behaviour possible.
 state_path: "./meshwars-bot-state.json"
 
+# The optional built-in web config UI (see README.md and --web/--web-bind).
+# Off by default -- it binds with NO authentication, so turning it on (here
+# or with --web) is an explicit choice, and bind_host should stay on a
+# trusted LAN. A config saved through the UI takes effect on the bot's NEXT
+# poll cycle -- no restart needed.
+web:
+  enabled: false
+  bind_host: "0.0.0.0"
+  bind_port: 8471
+
 # One entry per mesh channel/radio you want announcements relayed to. A
 # single feed can fan out to many destinations, each with its own filters.
 destinations:

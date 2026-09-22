@@ -10,6 +10,12 @@ a transport.
 import datetime
 from abc import ABC, abstractmethod
 
+# Every destination's DryRunSink writes to this same fixed path (make_sink()
+# below never overrides it) -- named here, rather than left as a bare
+# default-argument literal, so webui.py's dry-run log tail can point at the
+# exact same file without guessing or duplicating the string.
+DEFAULT_DRYRUN_LOG_PATH = "./meshwars-bot-dryrun.log"
+
 
 class Sink(ABC):
     """Something a routed announcement's text can be sent to."""
@@ -29,7 +35,7 @@ class DryRunSink(Sink):
     later task adds real transports.
     """
 
-    def __init__(self, destination_name: str, log_path: str = "./meshwars-bot-dryrun.log"):
+    def __init__(self, destination_name: str, log_path: str = DEFAULT_DRYRUN_LOG_PATH):
         self.destination_name = destination_name
         self.log_path = log_path
 

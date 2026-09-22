@@ -47,8 +47,46 @@ Nothing is sent anywhere. To run continuously instead of once, drop
 `--once`; the process polls, sleeps for the interval the server tells it to
 (or 15 minutes if that's unavailable), and repeats forever.
 
-Run the test suite with `python3 -m pytest tests/ -q` — currently 51 tests,
+Run the test suite with `python3 -m pytest tests/ -q` — currently 65 tests,
 all passing.
+
+## Web config UI
+
+Instead of hand-editing `config.yaml` over SSH, the bot can serve a small
+built-in web page for it:
+
+```
+python3 -m meshwars_bot.main --config config.yaml --web
+```
+
+Then open `http://<host>:8471/` (or whatever `web.bind_port` is set to).
+From that page you can edit `feed.base_url`/`timeout_seconds`, set or clear
+the feed API key, add/edit/remove destinations, toggle each destination's
+`dry_run` safety switch, tick its `kinds`, and pick its `net_ids` from a
+checklist of real net names (falling back to a manual comma-separated field
+if the feed server doesn't yet expose `/api/v1/nets`). It also shows the
+poll cursor, last poll time, last error, per-destination sent counts,
+whether the feed is currently reachable, and a live tail of the dry-run
+log. A config saved through the page takes effect on the bot's **next poll
+cycle** — the process re-reads `config.yaml` at the top of every cycle, so
+there's no restart involved.
+
+**This UI has no authentication whatsoever.** Anyone who can reach the
+bound host and port can read and change the bot's configuration —
+including its feed URL, API key, and every destination's dry-run switch.
+It defaults to off (`web.enabled: false` in config.yaml, and `--web` is
+required to turn it on for a run). When it is on, it defaults to binding
+`0.0.0.0:8471` — **all interfaces, no login** — so only enable it on a
+trusted LAN, never on a host with any public exposure. Set `web.bind_host`
+in `config.yaml` (or pass `--web-bind HOST:PORT` to override both host and
+port for a single run) to bind somewhere narrower, e.g. a specific LAN
+interface.
+
+The web server runs on its own daemon thread; a bug or crash in it is
+logged and never stops the poll loop, and radio transports remain exactly
+as unimplemented as ever from this UI's side — `sinks.make_sink()` still
+raises `NotImplementedError` for anything that isn't dry-run, regardless of
+what the page lets you toggle.
 
 ## Configuration reference
 
@@ -60,6 +98,9 @@ All fields, as they appear in `config.example.yaml`:
 | `feed.api_key` | top | Optional, sent as the `X-API-Key` header. Empty string means keyless polling. |
 | `feed.timeout_seconds` | top | HTTP timeout per poll request. Default 20. |
 | `state_path` | top | Where the cursor/ETag/sent-record JSON file is written. Must be writable and persistent. Default `./meshwars-bot-state.json`. |
+| `web.enabled` | top | Start the web config UI alongside the poll loop. Default `false`. Same effect as passing `--web`. |
+| `web.bind_host` | top | Interface the web UI binds to. Default `"0.0.0.0"` (all interfaces) — see the Web config UI section above before changing this on anything but a trusted LAN. |
+| `web.bind_port` | top | Port the web UI binds to. Default `8471`. |
 | `destinations[].name` | destination | Unique identifier for this destination. Used in logs, in the dry-run log lines, and as the key under which sent-announcement IDs are tracked. |
 | `destinations[].transport` | destination | `meshcore`, `meshtastic`, or `dryrun`. Only meaningful once real transports exist — see Status above. |
 | `destinations[].host` / `.port` / `.channel` | destination | Connection details for the (future) real transport. Unused while `dry_run` is true. |

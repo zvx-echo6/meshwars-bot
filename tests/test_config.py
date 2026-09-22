@@ -10,6 +10,7 @@ from meshwars_bot.config import (
     ConfigError,
     Destination,
     build_config,
+    multi_budget_warning_info,
     parse_yaml_subset,
 )
 from meshwars_bot.sinks import DryRunSink, make_sink
@@ -219,6 +220,90 @@ class TestMultiBudgetWarning(unittest.TestCase):
         with mock.patch.object(logger, "warning") as warn:
             build_config(raw)
         warn.assert_not_called()
+
+
+class TestWebConfig(unittest.TestCase):
+    """The optional `web` section (the built-in config UI's own
+    enabled/bind_host/bind_port), validated the same defensive way as
+    every other section -- absent entirely means all defaults."""
+
+    def test_absent_web_section_uses_defaults(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        config = build_config(raw)
+        self.assertFalse(config.web.enabled)
+        self.assertEqual(config.web.bind_host, "0.0.0.0")
+        self.assertEqual(config.web.bind_port, 8471)
+
+    def test_explicit_web_section_is_respected(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = {"enabled": True, "bind_host": "127.0.0.1", "bind_port": 9000}
+        config = build_config(raw)
+        self.assertTrue(config.web.enabled)
+        self.assertEqual(config.web.bind_host, "127.0.0.1")
+        self.assertEqual(config.web.bind_port, 9000)
+
+    def test_web_enabled_must_be_boolean(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = {"enabled": "yes"}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("web.enabled", str(ctx.exception))
+
+    def test_web_bind_port_must_be_in_range(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = {"bind_port": 70000}
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("web.bind_port", str(ctx.exception))
+
+    def test_web_bind_port_must_be_an_integer(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = {"bind_port": "not-a-port"}
+        with self.assertRaises(ConfigError):
+            build_config(raw)
+
+    def test_web_bind_host_must_be_non_empty_string(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = {"bind_host": ""}
+        with self.assertRaises(ConfigError):
+            build_config(raw)
+
+    def test_web_section_must_be_a_mapping(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["web"] = "not-a-mapping"
+        with self.assertRaises(ConfigError):
+            build_config(raw)
+
+
+class TestMultiBudgetWarningInfo(unittest.TestCase):
+    """Pure (no-logging) form of the multi-budget/no-api-key check, used by
+    webui.py to surface the same warning in the config page."""
+
+    def test_returns_none_when_condition_does_not_hold(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["text_budget"] = 150
+        raw["destinations"][1]["text_budget"] = 150
+        config = build_config(raw)
+        self.assertIsNone(multi_budget_warning_info(config.feed, config.destinations))
+
+    def test_returns_info_dict_when_condition_holds(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["text_budget"] = 150
+        raw["destinations"][1]["text_budget"] = 237
+        raw["feed"]["api_key"] = ""
+        config = build_config(raw)
+        info = multi_budget_warning_info(config.feed, config.destinations)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["budgets"], [150, 237])
+        self.assertEqual(info["requests_per_hour"], 8)
+
+    def test_none_when_api_key_set_even_with_multiple_budgets(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["text_budget"] = 150
+        raw["destinations"][1]["text_budget"] = 237
+        raw["feed"]["api_key"] = "secret"
+        config = build_config(raw)
+        self.assertIsNone(multi_budget_warning_info(config.feed, config.destinations))
 
 
 class TestMakeSink(unittest.TestCase):

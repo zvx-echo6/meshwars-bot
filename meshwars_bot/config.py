@@ -248,6 +248,14 @@ MAX_TEXT_BUDGET = 1000
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_STATE_PATH = "./meshwars-bot-state.json"
 
+# Defaults for the optional built-in web config UI (see webui.py). Disabled
+# by default -- it binds with NO authentication, so it must be an explicit
+# opt-in (config `web.enabled: true` or the `--web` CLI flag), never on by
+# default just because a config file exists.
+DEFAULT_WEB_ENABLED = False
+DEFAULT_WEB_BIND_HOST = "0.0.0.0"
+DEFAULT_WEB_BIND_PORT = 8471
+
 
 def normalize_board(board: str) -> str:
     """Canonicalize a board value ('mc'/'meshcore'/'mt'/'meshtastic') to 'mc' or 'mt'."""
@@ -276,10 +284,18 @@ class Destination:
 
 
 @dataclass
+class WebConfig:
+    enabled: bool = DEFAULT_WEB_ENABLED
+    bind_host: str = DEFAULT_WEB_BIND_HOST
+    bind_port: int = DEFAULT_WEB_BIND_PORT
+
+
+@dataclass
 class Config:
     feed: FeedConfig
     state_path: str
     destinations: List[Destination] = field(default_factory=list)
+    web: WebConfig = field(default_factory=WebConfig)
 
 
 def _clamp_text_budget(value: Any, dest_name: str) -> int:
@@ -373,6 +389,24 @@ def _build_destination(raw: Dict[str, Any], index: int) -> Destination:
     )
 
 
+def multi_budget_warning_info(
+    feed: FeedConfig, destinations: List[Destination]
+) -> Optional[Dict[str, Any]]:
+    """Pure (no logging) check for the multi-budget/no-api-key condition.
+
+    Returns None when the condition doesn't hold, else a dict describing it
+    -- {"budgets": [...], "requests_per_hour": N}. Split out from
+    `_warn_on_multi_budget_without_api_key` below so a caller that isn't
+    reading logs (namely webui.py, which needs to show this same warning in
+    the config page) can ask the question directly instead of duplicating
+    the arithmetic. See that function's docstring for why this matters.
+    """
+    budgets = sorted({d.text_budget for d in destinations})
+    if len(budgets) > 1 and not feed.api_key:
+        return {"budgets": budgets, "requests_per_hour": len(budgets) * 4}
+    return None
+
+
 def _warn_on_multi_budget_without_api_key(feed: FeedConfig, destinations: List[Destination]) -> None:
     """Warn (not error) at load time when a config both:
       - has more than one distinct `text_budget` across its destinations, and
@@ -388,8 +422,8 @@ def _warn_on_multi_budget_without_api_key(feed: FeedConfig, destinations: List[D
     An API key raises that limit; a single shared `text_budget` avoids the
     multiplier entirely.
     """
-    budgets = sorted({d.text_budget for d in destinations})
-    if len(budgets) > 1 and not feed.api_key:
+    info = multi_budget_warning_info(feed, destinations)
+    if info is not None:
         logger.warning(
             "config has %d distinct text_budget values across destinations "
             "(%s) and no feed.api_key is set. Each distinct text_budget costs "
@@ -398,10 +432,38 @@ def _warn_on_multi_budget_without_api_key(feed: FeedConfig, destinations: List[D
             "feed tier's 6 requests/hour/IP limit and start getting 429s. "
             "Set feed.api_key, or make every destination share a single "
             "text_budget, to avoid this.",
-            len(budgets),
-            budgets,
-            len(budgets) * 4,
+            len(info["budgets"]),
+            info["budgets"],
+            info["requests_per_hour"],
         )
+
+
+def _build_web_config(raw: Any) -> WebConfig:
+    """Validate the optional `web` section (the built-in config UI's own
+    enabled/bind_host/bind_port). Absent entirely -> all defaults, i.e. the
+    UI stays off unless someone opts in."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("'web' section must be a mapping")
+
+    enabled = raw.get("enabled", DEFAULT_WEB_ENABLED)
+    if not isinstance(enabled, bool):
+        raise ConfigError("'web.enabled' must be a boolean")
+
+    bind_host = raw.get("bind_host", DEFAULT_WEB_BIND_HOST)
+    if not isinstance(bind_host, str) or not bind_host:
+        raise ConfigError("'web.bind_host' must be a non-empty string")
+
+    bind_port = raw.get("bind_port", DEFAULT_WEB_BIND_PORT)
+    try:
+        bind_port = int(bind_port)
+    except (TypeError, ValueError):
+        raise ConfigError("'web.bind_port' must be an integer")
+    if not (1 <= bind_port <= 65535):
+        raise ConfigError("'web.bind_port' must be between 1 and 65535")
+
+    return WebConfig(enabled=enabled, bind_host=bind_host, bind_port=bind_port)
 
 
 def build_config(raw: Dict[str, Any]) -> Config:
@@ -429,7 +491,9 @@ def build_config(raw: Dict[str, Any]) -> Config:
 
     _warn_on_multi_budget_without_api_key(feed, destinations)
 
-    return Config(feed=feed, state_path=state_path, destinations=destinations)
+    web = _build_web_config(raw.get("web", {}))
+
+    return Config(feed=feed, state_path=state_path, destinations=destinations, web=web)
 
 
 def load_config(path: str) -> Config:
