@@ -81,10 +81,29 @@ class DryRunSink(Sink):
 
     def send(self, text: str) -> bool:
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        line = f"[{timestamp}] [{self.destination_name}] {text}"
-        print(line)
+        header = f"[{timestamp}] [{self.destination_name}]"
+
+        # MeshWars announcements can now be multi-line (app/mesh_render.py's
+        # block format on the meshwars-dev side) -- ONE record still, never
+        # fragmented across radio packets (that rule lives on the transmit
+        # side; this is purely a log presentation concern). A bare `text`
+        # embedded verbatim would put each of its own lines on its own
+        # physical log line with no marker at all, indistinguishable from
+        # the NEXT send()'s entry once webui.py's _tail_lines()/the /api/log
+        # pane reads the file back line-by-line. Continuation lines are
+        # indented with a "    | " marker instead, so a multi-line entry
+        # stays visually one record in both a raw `tail` of the file and
+        # the web UI's log pane (which just joins the returned lines with
+        # "\n" into a <pre> block and displays them verbatim).
+        lines = text.split("\n")
+        if len(lines) == 1:
+            out = f"{header} {text}"
+        else:
+            out = "\n".join([f"{header} {lines[0]}"] + [f"    | {cont}" for cont in lines[1:]])
+
+        print(out)
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+            f.write(out + "\n")
         return True
 
 

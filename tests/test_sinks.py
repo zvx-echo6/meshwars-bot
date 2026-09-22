@@ -11,6 +11,7 @@ touches any real host; every fake is pure in-memory Python.
 import enum
 import os
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import dataclass, field
@@ -566,6 +567,63 @@ class TestMeshCoreSink(unittest.TestCase):
                 result = sink.send("x")
         self.assertFalse(result)
         sink.close()
+
+
+class TestDryRunSinkMultiLine(unittest.TestCase):
+    """meshwars-dev's app/mesh_render.py can now hand a sink a multi-line
+    block (its newline-separated "MW Weekly Top 5" etc. format) instead
+    of the single sentence line this whole module was originally built
+    around. DryRunSink.send() must keep such a record visually distinct
+    from the next log entry when read back line-by-line (webui.py's
+    _tail_lines()/the /api/log pane) -- these tests are purely about that
+    log PRESENTATION; nothing here touches the byte-budget check (still
+    exercised by _fits_budget, unchanged) or the real transports.
+    """
+
+    def setUp(self):
+        fd, self.log_path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, self.log_path)
+
+    def _lines(self):
+        with open(self.log_path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def test_single_line_text_is_unchanged(self):
+        sink = DryRunSink("dest", log_path=self.log_path)
+        sink.send("MW MC 8-14 Sep: BLUE climbed to 1st")
+        lines = self._lines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith("[dest] MW MC 8-14 Sep: BLUE climbed to 1st"))
+
+    def test_multiline_text_gets_a_header_and_indented_continuations(self):
+        sink = DryRunSink("dest", log_path=self.log_path)
+        block = "MW Weekly Top 5\n\U0001f7e2 GREEN = 1\n\U0001f7e1 YELLOW = 2"
+        sink.send(block)
+        lines = self._lines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].endswith("[dest] MW Weekly Top 5"))
+        self.assertEqual(lines[1], "    | \U0001f7e2 GREEN = 1")
+        self.assertEqual(lines[2], "    | \U0001f7e1 YELLOW = 2")
+
+    def test_multiline_entry_distinguishable_from_the_next_single_line_entry(self):
+        """The whole point: reading the file back line-by-line (as
+        webui.py's _tail_lines() does) must never let a multi-line
+        entry's continuation lines be mistaken for a separate log
+        record -- every continuation line carries the "    | " marker,
+        which a bracketed "[timestamp] [dest]" header never starts with.
+        """
+        sink = DryRunSink("dest", log_path=self.log_path)
+        sink.send("MW Daily Top 5\n\U0001f534 RED = 1")
+        sink.send("MW MC 19 Aug: RED climbed to 1st")
+        lines = self._lines()
+        self.assertEqual(len(lines), 3)
+        self.assertFalse(lines[1].startswith("["))  # continuation, not a new record
+        self.assertTrue(lines[2].startswith("["))  # the second send()'s own real header
+
+    def test_multiline_send_still_returns_true(self):
+        sink = DryRunSink("dest", log_path=self.log_path)
+        self.assertTrue(sink.send("line one\nline two"))
 
 
 class TestSinkNeverOpensRealSocket(unittest.TestCase):
