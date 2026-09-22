@@ -1,0 +1,74 @@
+# meshwars-bot config example. Copy to config.yaml and edit.
+#
+# Parsed by meshwars_bot/config.py's small, hand-rolled YAML-subset parser
+# (there is no PyYAML dependency here) -- see that file's docstring for
+# exactly what YAML features it supports. Keep this file within that subset:
+# plain 2-space indentation, quoted strings, bare ints/bools, and inline
+# `[...]` lists of scalars only.
+
+feed:
+  # Base URL of the MeshWars instance whose public announcement feed this
+  # bot polls. The bot GETs {base_url}/api/v1/announcements.
+  base_url: "https://meshwars.com"
+
+  # Optional API key sent as the X-API-Key header. Keyless polling works;
+  # an API key just raises your rate limit. Empty string = keyless.
+  api_key: ""
+
+  # HTTP request timeout, in seconds, for each poll.
+  timeout_seconds: 20
+
+# Where the bot's durable state (feed cursor, ETag, and the record of which
+# announcements have already been sent to which destination) is written.
+# Must be writable, and must survive restarts -- this is what makes the
+# first-run "fast-forward, send nothing" behaviour possible.
+state_path: "./meshwars-bot-state.json"
+
+# One entry per mesh channel/radio you want announcements relayed to. A
+# single feed can fan out to many destinations, each with its own filters.
+destinations:
+  - name: "mwmesh-mc"
+
+    # Which transport delivers the message. Only "dryrun" (or any
+    # destination with dry_run: true, see below) is implemented in this
+    # repo -- "meshcore" and "meshtastic" are real radio transports that
+    # land in a later task. Selecting them here with dry_run left at its
+    # default (true) is fine for now: dry_run wins, nothing transmits.
+    transport: "meshcore"   # meshcore | meshtastic | dryrun
+
+    # Connection details for the (future) real transport. Unused while
+    # dry_run is true.
+    host: "192.168.1.100"
+    port: 5000
+    channel: "#meshwars"
+
+    # Which board's announcements this destination carries. One of:
+    # "mc" / "meshcore" / "mt" / "meshtastic" (the first pair and second
+    # pair are aliases for the same two boards). An announcement is only
+    # relayed to a destination whose board matches the announcement's board.
+    board: "mc"
+
+    # Safety switch. MUST default to true when this key is absent entirely
+    # -- config.py enforces that default. While true, nothing is ever
+    # transmitted: messages are only appended to a local dry-run log file
+    # and printed to stdout. Only flip this to false once a real transport
+    # exists for this destination (not yet -- that's a later task, and
+    # doing so today raises NotImplementedError on purpose).
+    dry_run: true
+
+    # Upper bound, in bytes, the feed fits each announcement's `text` to
+    # for this destination. Clamped server-side (and by this bot) to
+    # 20-1000; the bot relays `text` exactly as the server fitted it and
+    # never re-fits it locally.
+    text_budget: 150
+
+    # Explicit allow-list of announcement kinds this destination relays.
+    # An announcement whose kind isn't in this list is never sent here.
+    kinds: ["daily_recap", "weekly_recap", "month_honors", "net_wrapup"]
+
+    # Explicit allow-list of net IDs whose net-related announcements this
+    # destination relays. IMPORTANT: an EMPTY list ([]) means NO net
+    # announcements reach this destination -- it is an opt-in list, not a
+    # wildcard that defaults to "all nets" when left empty. List the net
+    # IDs you actually want (e.g. [1, 2]) to receive their announcements.
+    net_ids: [1]
