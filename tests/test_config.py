@@ -13,7 +13,7 @@ from meshwars_bot.config import (
     multi_budget_warning_info,
     parse_yaml_subset,
 )
-from meshwars_bot.sinks import DryRunSink, make_sink
+from meshwars_bot.sinks import DryRunSink, MeshCoreSink, make_sink
 
 EXAMPLE_YAML = """
 feed:
@@ -309,13 +309,14 @@ class TestMultiBudgetWarningInfo(unittest.TestCase):
 class TestMakeSink(unittest.TestCase):
     """make_sink() lives in sinks.py but is exercised here against real
     Destination objects built via config, since its critical behaviour
-    (raising for anything other than dry_run) is a config-driven safety
-    property."""
+    (dry_run always wins, checked before anything else) is a config-driven
+    safety property. Full coverage of the real sinks themselves (pacing,
+    reconnect, transport specifics) lives in test_sinks.py."""
 
-    def _destination(self, dry_run: bool) -> Destination:
+    def _destination(self, dry_run: bool, transport: str = "meshcore") -> Destination:
         return Destination(
             name="d1",
-            transport="meshcore",
+            transport=transport,
             host="127.0.0.1",
             port=1234,
             channel="#x",
@@ -330,9 +331,17 @@ class TestMakeSink(unittest.TestCase):
         sink = make_sink(self._destination(dry_run=True))
         self.assertIsInstance(sink, DryRunSink)
 
-    def test_dry_run_false_raises_not_implemented(self):
+    def test_dry_run_false_returns_real_sink_and_never_raises(self):
+        # This is the behaviour this repo's later task delivers: make_sink()
+        # no longer raises for a real, non-dry-run destination -- it builds
+        # the matching real Sink instead (which imports no radio library at
+        # construction time; that stays lazy until a real send is attempted).
+        sink = make_sink(self._destination(dry_run=False))
+        self.assertIsInstance(sink, MeshCoreSink)
+
+    def test_dry_run_false_unknown_transport_still_raises_not_implemented(self):
         with self.assertRaises(NotImplementedError):
-            make_sink(self._destination(dry_run=False))
+            make_sink(self._destination(dry_run=False, transport="dryrun"))
 
 
 if __name__ == "__main__":

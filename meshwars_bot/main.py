@@ -5,6 +5,7 @@ destinations, send via sinks, persist state, sleep, repeat.
 import argparse
 import datetime
 import logging
+import re
 import sys
 import threading
 import time
@@ -14,13 +15,97 @@ from typing import Dict, List, Optional
 from .config import Config, DEFAULT_TEXT_BUDGET, Destination, load_config
 from .feed import FeedClient, FeedPage
 from .router import should_relay
-from .sinks import make_sink
+from .sinks import Sink, make_sink
 from .state import State, fast_forward_on_first_run, load_state, save_state
 from .webui import BotStatus, start_webui
 
 logger = logging.getLogger("meshwars_bot.main")
 
 DEFAULT_POLL_INTERVAL_SECONDS = 900
+
+
+class SinkCache:
+    """Keeps one Sink instance alive per destination, reused across poll
+    cycles, instead of rebuilding (and reconnecting) every cycle.
+
+    WHY THIS EXISTS: a MeshCore companion port accepts exactly ONE client.
+    Before this cache existed, every poll cycle rebuilt `sinks_cache = {}`
+    from scratch and never closed the previous cycle's sinks -- invisible
+    while DryRunSink (stateless) was the only sink, but with real
+    MeshtasticSink/MeshCoreSink holding live TCP connections, rebuilding
+    every cycle means a brand-new connection attempt roughly every 15
+    minutes while the previous connection is only torn down whenever GC
+    happens to collect it. Against a MeshCore companion that is not merely
+    wasteful -- a second concurrent client can make the NEW connection fail
+    or hang, and either way it churns a link that had no reason to drop.
+
+    A sink is kept as long as its destination's full connection identity
+    -- name, transport, host, port, channel, dry_run -- is unchanged
+    across a config reload. If the operator edits any of those through the
+    (hot-reloaded) web UI, the old sink is closed and a new one built for
+    the new identity. A destination removed from the config has its sink
+    closed and dropped.
+    """
+
+    def __init__(self):
+        self._sinks: Dict[str, Sink] = {}
+        self._identities: Dict[str, tuple] = {}
+
+    @staticmethod
+    def _identity(destination: Destination) -> tuple:
+        return (
+            destination.name,
+            destination.transport,
+            destination.host,
+            destination.port,
+            destination.channel,
+            destination.dry_run,
+        )
+
+    def reconcile(self, destinations: List[Destination]) -> Dict[str, Sink]:
+        """Return {destination.name: Sink}, one per destination, built
+        fresh only where needed: reused when the destination's identity is
+        unchanged from last call, closed-and-rebuilt when it changed. Any
+        previously cached sink whose destination is no longer present is
+        closed and dropped."""
+        current_names = set()
+        result: Dict[str, Sink] = {}
+
+        for destination in destinations:
+            current_names.add(destination.name)
+            identity = self._identity(destination)
+            if destination.name in self._sinks and self._identities[destination.name] == identity:
+                result[destination.name] = self._sinks[destination.name]
+                continue
+            if destination.name in self._sinks:
+                self._close_one(destination.name, self._sinks[destination.name])
+            sink = make_sink(destination)
+            self._sinks[destination.name] = sink
+            self._identities[destination.name] = identity
+            result[destination.name] = sink
+
+        for name in list(self._sinks):
+            if name not in current_names:
+                self._close_one(name, self._sinks.pop(name))
+                self._identities.pop(name, None)
+
+        return result
+
+    def _close_one(self, name: str, sink: Sink) -> None:
+        # close() must NEVER raise into the poll loop -- a broken close on
+        # one destination must never stop the others being closed, or take
+        # down the cycle that triggered it.
+        try:
+            sink.close()
+        except Exception as e:  # noqa: BLE001 - see comment above
+            logger.warning("failed to close sink for destination=%s: %s", name, e)
+
+    def close_all(self) -> None:
+        """Close every currently cached sink. Called on shutdown (normal
+        exit, KeyboardInterrupt, and after --once completes)."""
+        for name in list(self._sinks):
+            self._close_one(name, self._sinks.pop(name))
+        self._identities.clear()
 
 
 def _group_destinations_by_budget(config: Config) -> Dict[int, List[Destination]]:
@@ -54,7 +139,11 @@ def _fits_budget(text: str, budget: int) -> bool:
 
 
 def run_once(
-    config: Config, state: State, feed_client: FeedClient, status: Optional[BotStatus] = None
+    config: Config,
+    state: State,
+    feed_client: FeedClient,
+    status: Optional[BotStatus] = None,
+    sinks_cache: Optional[SinkCache] = None,
 ) -> int:
     """Run a single poll -> route -> send -> persist cycle.
 
@@ -75,13 +164,19 @@ def run_once(
     timestamp, error, feed reachability, per-destination sent counts) for
     the web UI's /api/state route to read. Entirely optional -- run_once()
     must work exactly as before when no web UI is running.
+
+    `sinks_cache`, when given, is a `SinkCache` the caller keeps across
+    cycles so sinks are reused rather than rebuilt (see SinkCache's
+    docstring for why that matters). Pass the SAME instance on every call
+    for reuse to actually happen -- a fresh one each call (the default when
+    omitted) means every call builds its own sinks, same as calling
+    run_once() once in isolation.
     """
     budget_groups = _group_destinations_by_budget(config)
 
-    sinks_cache = {}
-    for destination in config.destinations:
-        if destination.name not in sinks_cache:
-            sinks_cache[destination.name] = make_sink(destination)
+    if sinks_cache is None:
+        sinks_cache = SinkCache()
+    sinks = sinks_cache.reconcile(config.destinations)
 
     # --- Fetch phase -----------------------------------------------------
     # `since`/`etag` are read ONCE, before any group is fetched, and every
@@ -138,7 +233,7 @@ def run_once(
                         destination.text_budget,
                     )
                     continue
-                sink = sinks_cache[destination.name]
+                sink = sinks[destination.name]
                 sent_ok = sink.send(announcement.text)
                 if sent_ok:
                     state.mark_sent(destination.name, announcement.id)
@@ -268,6 +363,7 @@ def run_cycle(
     feed_client: FeedClient,
     status: Optional[BotStatus] = None,
     ff_tracker: Optional[Dict[str, bool]] = None,
+    sinks_cache: Optional[SinkCache] = None,
 ) -> int:
     """Run one iteration of the main loop.
 
@@ -285,6 +381,10 @@ def run_cycle(
     than spamming an identical line every cycle -- per-cycle noise while
     still failing goes to DEBUG instead. Pass the same dict on every call
     for this to work; a fresh dict each call defeats the point.
+
+    `sinks_cache` is passed straight through to `run_once()` -- see its
+    docstring. Pass the SAME `SinkCache` instance on every call across the
+    loop's lifetime for sinks to actually be reused between cycles.
 
     Returns the number of seconds the caller should sleep before the next
     cycle.
@@ -333,7 +433,7 @@ def run_cycle(
 
     if status is not None:
         status.update(has_safe_cursor=True)
-    return run_once(config, state, feed_client, status=status)
+    return run_once(config, state, feed_client, status=status, sinks_cache=sinks_cache)
 
 
 def _reload_config(config_path: str, previous: Config) -> Config:
@@ -355,15 +455,51 @@ def _reload_config(config_path: str, previous: Config) -> Config:
     return reloaded
 
 
+# Bracketed HOST:PORT, e.g. "[::1]:8471" or "[2001:db8::1]:8471" -- the
+# brackets are what let an IPv6 literal (which itself contains colons) be
+# told apart from the ":PORT" suffix.
+_BRACKETED_WEB_BIND_RE = re.compile(r"^\[(?P<host>[^\]]*)\]:(?P<port>[0-9]+)$")
+
+
 def _resolve_web_bind(config: Config, bind_override: Optional[str]) -> tuple:
     """Resolve the (host, port) the web UI should bind to: `--web-bind`
-    overrides `config.web.bind_host`/`bind_port` when given."""
+    overrides `config.web.bind_host`/`bind_port` when given.
+
+    Accepts `HOST:PORT` for a hostname or IPv4 literal, and `[HOST]:PORT`
+    for a bracketed IPv6 literal (e.g. `[::1]:8471`). Brackets are REQUIRED
+    for IPv6: an IPv6 address contains colons itself, so a naive
+    `rpartition(":")` on `::1:8471` would silently split it into a wrong
+    host/port pair instead of failing loudly. Anything with more than one
+    ':' that isn't in the bracketed form is rejected with a clear error
+    rather than guessed at.
+    """
     if bind_override is None:
         return config.web.bind_host, config.web.bind_port
+
+    bracketed = _BRACKETED_WEB_BIND_RE.match(bind_override)
+    if bracketed:
+        host = bracketed.group("host")
+        port_str = bracketed.group("port")
+        if not host:
+            raise ValueError(f"--web-bind bracketed host must not be empty, got {bind_override!r}")
+        return host, int(port_str)
+
+    if bind_override.count(":") > 1:
+        raise ValueError(
+            "--web-bind must be HOST:PORT, or [IPV6]:PORT (brackets required) "
+            f"for an IPv6 literal -- got {bind_override!r}"
+        )
+
     host, _, port_str = bind_override.rpartition(":")
     if not host or not port_str:
         raise ValueError(f"--web-bind must be HOST:PORT, got {bind_override!r}")
-    return host, int(port_str)
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(
+            f"--web-bind port must be an integer, got {port_str!r} in {bind_override!r}"
+        )
+    return host, port
 
 
 def _run_webui_thread(
@@ -451,38 +587,56 @@ def main(argv=None) -> int:
         timeout_seconds=config.feed.timeout_seconds,
     )
 
-    if args.once:
-        # `--once` keeps its original, strict semantics even with `--web`:
-        # a single cycle, then exit -- and a failed fast-forward must still
-        # be an honest non-zero exit so a script can tell it failed. This
-        # is the one place a failed fast-forward is NOT silently retried.
-        if state.since is None:
-            ok = _try_fast_forward(config, state, feed_client)
-            if not ok:
-                logger.error("fast-forward poll failed; refusing to start without a safe cursor")
-                return 1
-        run_once(config, state, feed_client, status=status)
+    # One SinkCache for the lifetime of this process -- sinks are built
+    # once per destination and reused across cycles (see SinkCache's
+    # docstring for why: a MeshCore companion accepts exactly one client,
+    # so rebuilding/reconnecting every cycle is not just wasteful, it can
+    # lose the link). The try/finally below is what guarantees every sink
+    # this cache ever built gets close()'d exactly once on the way out --
+    # normal return, an uncaught exception mid-cycle, or KeyboardInterrupt
+    # -- so a live connection can never be silently leaked.
+    sinks_cache = SinkCache()
+    try:
+        if args.once:
+            # `--once` keeps its original, strict semantics even with
+            # `--web`: a single cycle, then exit -- and a failed
+            # fast-forward must still be an honest non-zero exit so a
+            # script can tell it failed. This is the one place a failed
+            # fast-forward is NOT silently retried.
+            if state.since is None:
+                ok = _try_fast_forward(config, state, feed_client)
+                if not ok:
+                    logger.error("fast-forward poll failed; refusing to start without a safe cursor")
+                    return 1
+            run_once(config, state, feed_client, status=status, sinks_cache=sinks_cache)
+            return 0
+
+        ff_tracker = {"failed": False}
+        while True:
+            # Re-read the config file at the top of EVERY cycle, rather
+            # than once at startup, so a config saved through the web UI
+            # takes effect on the very next poll -- no restart. `state` is
+            # NOT reloaded here: nothing editable through the UI touches
+            # state_path or state.json itself, and the in-memory `state`
+            # object (with whatever this run has already marked sent) must
+            # stay the single source of truth across cycles, never
+            # clobbered by re-reading a stale copy from disk mid-run.
+            config = _reload_config(args.config, config)
+            feed_client = FeedClient(
+                base_url=config.feed.base_url,
+                api_key=config.feed.api_key,
+                timeout_seconds=config.feed.timeout_seconds,
+            )
+
+            sleep_seconds = run_cycle(
+                config, state, feed_client, status=status, ff_tracker=ff_tracker, sinks_cache=sinks_cache
+            )
+            time.sleep(sleep_seconds)
+    except KeyboardInterrupt:
+        logger.info("received KeyboardInterrupt; shutting down")
         return 0
-
-    ff_tracker = {"failed": False}
-    while True:
-        # Re-read the config file at the top of EVERY cycle, rather than
-        # once at startup, so a config saved through the web UI takes
-        # effect on the very next poll -- no restart. `state` is NOT
-        # reloaded here: nothing editable through the UI touches
-        # state_path or state.json itself, and the in-memory `state`
-        # object (with whatever this run has already marked sent) must
-        # stay the single source of truth across cycles, never clobbered
-        # by re-reading a stale copy from disk mid-run.
-        config = _reload_config(args.config, config)
-        feed_client = FeedClient(
-            base_url=config.feed.base_url,
-            api_key=config.feed.api_key,
-            timeout_seconds=config.feed.timeout_seconds,
-        )
-
-        sleep_seconds = run_cycle(config, state, feed_client, status=status, ff_tracker=ff_tracker)
-        time.sleep(sleep_seconds)
+    finally:
+        sinks_cache.close_all()
 
 
 if __name__ == "__main__":

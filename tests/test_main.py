@@ -11,7 +11,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from meshwars_bot import webui
 from meshwars_bot.config import Config, Destination, FeedConfig, load_config
 from meshwars_bot.feed import Announcement, FeedPage
-from meshwars_bot.main import _reload_config, main, run_cycle, run_once, spawn_webui_thread
+from meshwars_bot.main import (
+    SinkCache,
+    _reload_config,
+    _resolve_web_bind,
+    main,
+    run_cycle,
+    run_once,
+    spawn_webui_thread,
+)
 from meshwars_bot.state import State
 from meshwars_bot.webui import BotStatus
 
@@ -84,13 +92,22 @@ class FakeFeedClient:
 
 
 class FakeSink:
-    def __init__(self, destination_name):
+    def __init__(self, destination_name, raise_on_close=False):
         self.destination_name = destination_name
         self.sent = []
+        self.closed = False
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
 
     def send(self, text: str) -> bool:
         self.sent.append(text)
         return True
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+        if self._raise_on_close:
+            raise RuntimeError("close boom")
 
 
 class RunOnceTestCase(unittest.TestCase):
@@ -604,6 +621,338 @@ class TestWebServesWhileFeedUnreachable(RunOnceTestCase):
         self.assertIsNotNone(data["last_error"])
         self.assertIsNone(state.since)
         self.assertEqual(self.sinks, {})
+
+
+class TestSinkCache(unittest.TestCase):
+    """Unit tests for SinkCache.reconcile()/close_all() -- the reuse-across-
+    cycles fix. make_sink() itself is faked here so these tests are about
+    the cache's own bookkeeping (identity comparison, close-on-change,
+    close-on-removal), not about what a real sink does."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.built = []  # destination names, in the order make_sink() was called
+
+        def fake_make_sink(destination):
+            self.built.append(destination.name)
+            return FakeSink(destination.name)
+
+        patcher = mock.patch("meshwars_bot.main.make_sink", side_effect=fake_make_sink)
+        self.addCleanup(patcher.stop)
+        self.mock_make_sink = patcher.start()
+
+    def test_unchanged_destination_builds_sink_once_across_many_cycles(self):
+        cache = SinkCache()
+        dest = make_destination(name="a", transport="dryrun", dry_run=True)
+
+        sinks1 = cache.reconcile([dest])
+        sinks2 = cache.reconcile([dest])
+        sinks3 = cache.reconcile([dest])
+
+        self.assertEqual(self.mock_make_sink.call_count, 1)
+        self.assertEqual(self.built, ["a"])
+        self.assertIs(sinks1["a"], sinks2["a"])
+        self.assertIs(sinks2["a"], sinks3["a"])
+        self.assertFalse(sinks2["a"].closed)
+
+    def test_changing_any_identity_field_closes_old_and_builds_new(self):
+        base = dict(
+            name="a", transport="meshtastic", host="10.0.0.1", port=4403, channel="general", dry_run=False
+        )
+        variants = {
+            "host": dict(base, host="10.0.0.2"),
+            "port": dict(base, port=4404),
+            "channel": dict(base, channel="ops"),
+            "transport": dict(base, transport="meshcore"),
+            "dry_run": dict(base, dry_run=True),
+        }
+        for field_name, changed in variants.items():
+            with self.subTest(field=field_name):
+                cache = SinkCache()
+                dest_v1 = make_destination(**base)
+                dest_v2 = make_destination(**changed)
+
+                old_sink = cache.reconcile([dest_v1])["a"]
+                new_sink = cache.reconcile([dest_v2])["a"]
+
+                self.assertIsNot(old_sink, new_sink)
+                self.assertTrue(old_sink.closed, f"old sink not closed when {field_name} changed")
+                self.assertFalse(new_sink.closed)
+
+    def test_unrelated_field_change_does_not_rebuild(self):
+        # kinds/net_ids/board are not part of connection identity -- a
+        # routing-only edit must not churn the connection.
+        cache = SinkCache()
+        dest_v1 = make_destination(name="a", kinds=["daily_recap"])
+        dest_v2 = make_destination(name="a", kinds=["net_wrapup"])
+
+        sink1 = cache.reconcile([dest_v1])["a"]
+        sink2 = cache.reconcile([dest_v2])["a"]
+
+        self.assertIs(sink1, sink2)
+        self.assertEqual(self.mock_make_sink.call_count, 1)
+        self.assertFalse(sink1.closed)
+
+    def test_removed_destination_closes_its_sink_and_drops_it(self):
+        cache = SinkCache()
+        dest_a = make_destination(name="a")
+        dest_b = make_destination(name="b")
+
+        sinks1 = cache.reconcile([dest_a, dest_b])
+        sink_a, sink_b = sinks1["a"], sinks1["b"]
+
+        sinks2 = cache.reconcile([dest_b])
+
+        self.assertTrue(sink_a.closed)
+        self.assertFalse(sink_b.closed)
+        self.assertEqual(set(sinks2.keys()), {"b"})
+        self.assertIs(sinks2["b"], sink_b)
+
+        # And the removed destination coming back is treated as brand new
+        # (rebuilt), not resurrected from anywhere.
+        sinks3 = cache.reconcile([dest_a, dest_b])
+        self.assertIsNot(sinks3["a"], sink_a)
+
+    def test_close_all_closes_every_sink(self):
+        cache = SinkCache()
+        cache.reconcile([make_destination(name="a"), make_destination(name="b")])
+
+        cache.close_all()
+
+        self.assertEqual(self.built, ["a", "b"])
+        # A subsequent reconcile() for the same destinations must rebuild --
+        # close_all() drops everything from the cache.
+        rebuilt = cache.reconcile([make_destination(name="a"), make_destination(name="b")])
+        self.assertEqual(self.mock_make_sink.call_count, 4)
+        self.assertTrue(rebuilt["a"])
+
+    def test_close_all_closes_every_sink_even_if_one_raises(self):
+        cache = SinkCache()
+        sinks = cache.reconcile([make_destination(name="a"), make_destination(name="b")])
+        sinks["a"]._raise_on_close = True
+
+        cache.close_all()  # must not raise
+
+        self.assertEqual(sinks["a"].close_calls, 1)
+        self.assertTrue(sinks["a"].closed)
+        self.assertTrue(sinks["b"].closed)
+
+    def test_reconcile_close_failure_does_not_stop_the_new_sink_being_built(self):
+        cache = SinkCache()
+        sinks1 = cache.reconcile([make_destination(name="a", host="10.0.0.1", dry_run=False, transport="meshtastic")])
+        sinks1["a"]._raise_on_close = True
+
+        sinks2 = cache.reconcile(
+            [make_destination(name="a", host="10.0.0.2", dry_run=False, transport="meshtastic")]
+        )
+
+        self.assertIn("a", sinks2)
+        self.assertIsNot(sinks2["a"], sinks1["a"])
+
+
+class TestSinkCachePreservesDryRunGuarantee(unittest.TestCase):
+    """SinkCache must still go through the real make_sink(), so the
+    dry_run:true safety guarantee (never import/construct a real transport)
+    holds exactly as it does for a direct make_sink() call -- see
+    tests/test_sinks.py's TestMakeSinkDryRunSafety for the same check
+    against make_sink() itself."""
+
+    def test_dry_run_true_never_imports_a_real_library_through_the_cache(self):
+        from meshwars_bot.sinks import DryRunSink
+
+        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+        attempted = []
+
+        def spying_import(name, *args, **kwargs):
+            if name in ("meshtastic", "meshtastic.tcp_interface", "meshcore"):
+                attempted.append(name)
+            return real_import(name, *args, **kwargs)
+
+        from unittest import mock
+
+        cache = SinkCache()
+        dest = make_destination(name="a", transport="meshtastic", dry_run=True)
+
+        with mock.patch("builtins.__import__", side_effect=spying_import):
+            sinks1 = cache.reconcile([dest])
+            sinks2 = cache.reconcile([dest])
+
+        self.assertIsInstance(sinks1["a"], DryRunSink)
+        self.assertIs(sinks1["a"], sinks2["a"])
+        self.assertEqual(attempted, [], "dry_run=True must never import a radio library, cache or not")
+
+
+class TestRunOnceSinkReuse(unittest.TestCase):
+    """run_once()'s `sinks_cache` param is how the real fix (reuse across
+    poll cycles) reaches production -- exercised here directly against
+    run_once(), same as SinkCache's own unit tests but through the actual
+    poll/route/send entry point."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.make_sink_calls = []
+
+        def fake_make_sink(destination):
+            self.make_sink_calls.append(destination.name)
+            return FakeSink(destination.name)
+
+        patcher = mock.patch("meshwars_bot.main.make_sink", side_effect=fake_make_sink)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_sink_built_once_across_multiple_run_once_cycles_with_shared_cache(self):
+        dest = make_destination(name="a", text_budget=150)
+        config = make_config([dest])
+        state = State(since=100, etag=None)
+        client = FakeFeedClient(
+            {150: FeedPage(announcements=[], next_since=200, poll_interval_seconds=900)}
+        )
+        cache = SinkCache()
+
+        run_once(config, state, client, sinks_cache=cache)
+        run_once(config, state, client, sinks_cache=cache)
+        run_once(config, state, client, sinks_cache=cache)
+
+        self.assertEqual(self.make_sink_calls, ["a"])
+
+    def test_without_a_shared_cache_each_call_gets_its_own_fresh_sink(self):
+        # Documents the deliberate fallback: run_once() with no sinks_cache
+        # builds a throwaway SinkCache for that one call -- what every other
+        # test in this file relies on. The actual reuse-across-cycles fix
+        # lives in main()'s persistent SinkCache, threaded through
+        # run_cycle().
+        dest = make_destination(name="a", text_budget=150)
+        config = make_config([dest])
+        state = State(since=100, etag=None)
+        client = FakeFeedClient(
+            {150: FeedPage(announcements=[], next_since=200, poll_interval_seconds=900)}
+        )
+
+        run_once(config, state, client)
+        run_once(config, state, client)
+
+        self.assertEqual(self.make_sink_calls, ["a", "a"])
+
+
+class TestSinksClosedOnShutdown(unittest.TestCase):
+    """End-to-end through main(): every sink built during a run must be
+    close()'d on the way out, whether that's --once completing normally or
+    the poll loop being interrupted."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config_path = os.path.join(self.tmpdir.name, "config.yaml")
+        self.state_path = os.path.join(self.tmpdir.name, "state.json")
+        self.sinks = {}
+
+    def _write_config(self):
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            f.write(
+                'feed:\n'
+                '  base_url: "https://meshwars.example"\n'
+                '  timeout_seconds: 5\n'
+                'state_path: "%s"\n'
+                'destinations:\n'
+                '  - name: a\n'
+                '    transport: dryrun\n'
+                '    board: mc\n'
+                '    dry_run: true\n'
+                '    text_budget: 150\n' % self.state_path
+            )
+
+    def _write_state(self):
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "since": 100, "etag": None, "sent": []}, f)
+
+    def _fake_make_sink(self, destination):
+        sink = FakeSink(destination.name)
+        self.sinks[destination.name] = sink
+        return sink
+
+    def test_once_closes_all_sinks_on_completion(self):
+        from unittest import mock
+
+        self._write_config()
+        self._write_state()
+
+        with mock.patch("meshwars_bot.main.make_sink", side_effect=self._fake_make_sink), mock.patch(
+            "meshwars_bot.main.FeedClient"
+        ) as MockFeedClient:
+            MockFeedClient.return_value.poll.return_value = FeedPage(
+                announcements=[], next_since=200, poll_interval_seconds=900
+            )
+            rc = main(["--config", self.config_path, "--once"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("a", self.sinks)
+        self.assertTrue(self.sinks["a"].closed)
+
+    def test_keyboard_interrupt_in_poll_loop_closes_all_sinks(self):
+        from unittest import mock
+
+        self._write_config()
+        self._write_state()
+
+        with mock.patch("meshwars_bot.main.make_sink", side_effect=self._fake_make_sink), mock.patch(
+            "meshwars_bot.main.FeedClient"
+        ) as MockFeedClient, mock.patch("meshwars_bot.main.time.sleep", side_effect=KeyboardInterrupt):
+            MockFeedClient.return_value.poll.return_value = FeedPage(
+                announcements=[], next_since=200, poll_interval_seconds=900
+            )
+            rc = main(["--config", self.config_path])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("a", self.sinks)
+        self.assertTrue(self.sinks["a"].closed)
+
+
+class TestResolveWebBindIPv6(unittest.TestCase):
+    """--web-bind must handle a bracketed IPv6 literal correctly, and never
+    silently mangle one -- see _resolve_web_bind()'s docstring."""
+
+    def test_no_override_uses_config_defaults(self):
+        config = make_config([])
+        config.web.bind_host = "127.0.0.1"
+        config.web.bind_port = 9000
+        self.assertEqual(_resolve_web_bind(config, None), ("127.0.0.1", 9000))
+
+    def test_plain_hostport_unchanged(self):
+        config = make_config([])
+        self.assertEqual(_resolve_web_bind(config, "0.0.0.0:8471"), ("0.0.0.0", 8471))
+
+    def test_bracketed_ipv6_loopback(self):
+        config = make_config([])
+        self.assertEqual(_resolve_web_bind(config, "[::1]:8471"), ("::1", 8471))
+
+    def test_bracketed_ipv6_full_literal(self):
+        config = make_config([])
+        self.assertEqual(_resolve_web_bind(config, "[2001:db8::1]:8471"), ("2001:db8::1", 8471))
+
+    def test_unbracketed_ipv6_literal_is_rejected_not_mangled(self):
+        # A naive rpartition(":") would silently produce host='::1',
+        # port='8471' here by luck, or worse for other literals -- it must
+        # be rejected outright, never guessed at.
+        config = make_config([])
+        with self.assertRaises(ValueError):
+            _resolve_web_bind(config, "::1:8471")
+
+    def test_empty_bracketed_host_is_rejected(self):
+        config = make_config([])
+        with self.assertRaises(ValueError):
+            _resolve_web_bind(config, "[]:8471")
+
+    def test_non_integer_port_is_rejected_clearly(self):
+        config = make_config([])
+        with self.assertRaises(ValueError):
+            _resolve_web_bind(config, "0.0.0.0:notaport")
+
+    def test_missing_port_is_rejected(self):
+        config = make_config([])
+        with self.assertRaises(ValueError):
+            _resolve_web_bind(config, "0.0.0.0")
 
 
 if __name__ == "__main__":

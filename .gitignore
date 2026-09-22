@@ -11,3 +11,6 @@ meshwars-bot-dryrun.log
 
 .venv/
 *.egg-info/
+
+# Web UI stdout when run detached.
+webui.out
