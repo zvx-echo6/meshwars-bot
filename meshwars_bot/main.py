@@ -12,11 +12,12 @@ import time
 from collections import Counter
 from typing import Dict, List, Optional
 
+from . import schedule
 from .config import Config, DEFAULT_TEXT_BUDGET, Destination, load_config
 from .feed import FeedClient, FeedPage
 from .router import should_relay
 from .sinks import Sink, make_sink
-from .state import State, fast_forward_on_first_run, load_state, save_state
+from .state import PendingItem, State, fast_forward_on_first_run, load_state, save_state
 from .webui import BotStatus, start_webui
 
 logger = logging.getLogger("meshwars_bot.main")
@@ -144,6 +145,7 @@ def run_once(
     feed_client: FeedClient,
     status: Optional[BotStatus] = None,
     sinks_cache: Optional[SinkCache] = None,
+    now: Optional[datetime.datetime] = None,
 ) -> int:
     """Run a single poll -> route -> send -> persist cycle.
 
@@ -171,6 +173,11 @@ def run_once(
     for reuse to actually happen -- a fresh one each call (the default when
     omitted) means every call builds its own sinks, same as calling
     run_once() once in isolation.
+
+    `now`, when given, is the timezone-aware instant used to evaluate every
+    destination's send window (see schedule.in_window()) and to decide
+    what drains this cycle -- purely for deterministic tests; production
+    always omits it and gets the real current time.
     """
     budget_groups = _group_destinations_by_budget(config)
 
@@ -213,7 +220,16 @@ def run_once(
 
     # --- Route phase -------------------------------------------------------
     # Each budget group's announcements are only ever offered to the
-    # destinations that configured that exact budget.
+    # destinations that configured that exact budget. Every announcement
+    # should_relay() approves is queued onto that destination's durable
+    # pending list -- never sent directly from here. That is what makes
+    # ordering trivial: a destination's pending list always holds every
+    # relay-eligible announcement not yet delivered, whether it arrived
+    # this cycle or was held from an earlier one, and the drain phase below
+    # sends strictly oldest-id-first regardless of when each item was
+    # queued. A destination with no send window configured (the default)
+    # drains immediately, in this same cycle -- see schedule.in_window()
+    # -- so behaviour is unchanged for every config that doesn't opt in.
     for budget, destinations in budget_groups.items():
         page = pages[budget]
         if page is None or not page.announcements:
@@ -233,22 +249,63 @@ def run_once(
                         destination.text_budget,
                     )
                     continue
-                sink = sinks[destination.name]
-                sent_ok = sink.send(announcement.text)
-                if sent_ok:
-                    state.mark_sent(destination.name, announcement.id)
-                    logger.info(
-                        "sent announcement id=%s kind=%s -> destination=%s",
-                        announcement.id,
-                        announcement.kind,
-                        destination.name,
-                    )
-                else:
-                    logger.warning(
-                        "send failed for announcement id=%s -> destination=%s",
-                        announcement.id,
-                        destination.name,
-                    )
+                state.add_pending(
+                    destination.name,
+                    PendingItem(id=announcement.id, text=announcement.text, kind=announcement.kind),
+                )
+                logger.info(
+                    "queued announcement id=%s kind=%s -> destination=%s (%d pending)",
+                    announcement.id,
+                    announcement.kind,
+                    destination.name,
+                    len(state.pending.get(destination.name, [])),
+                )
+
+    # --- Drain phase ---------------------------------------------------------
+    # For every destination currently inside its send window (or with no
+    # window configured, which is always "inside"), relay its pending
+    # items oldest-id-first, stopping at the first failure so a transient
+    # send failure retries the SAME item next cycle rather than skipping
+    # ahead and reordering. This runs for every configured destination, not
+    # just ones that got a new announcement this cycle, so a destination
+    # with nothing new but an existing backlog still drains the moment its
+    # window opens -- and pacing between sends is whatever the sink itself
+    # already enforces (see sinks._PacedRealSink._pace()), since each item
+    # still goes through one sink.send() call at a time, exactly as before.
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    for destination in config.destinations:
+        pending = state.pending.get(destination.name)
+        if not pending:
+            continue
+        if not schedule.in_window(destination, now):
+            continue
+        sink = sinks[destination.name]
+        for item in sorted(pending, key=lambda p: p.id):
+            if state.has_sent(destination.name, item.id):
+                # Defensive: should never happen (the cursor moves past a
+                # queued item, so should_relay() can't re-approve it), but
+                # never resend -- just drop the stale duplicate.
+                state.remove_pending(destination.name, item.id)
+                continue
+            sent_ok = sink.send(item.text)
+            if sent_ok:
+                state.mark_sent(destination.name, item.id)
+                state.remove_pending(destination.name, item.id)
+                logger.info(
+                    "sent announcement id=%s kind=%s -> destination=%s",
+                    item.id,
+                    item.kind,
+                    destination.name,
+                )
+            else:
+                logger.warning(
+                    "send failed for announcement id=%s -> destination=%s; "
+                    "will retry next cycle",
+                    item.id,
+                    destination.name,
+                )
+                break
 
     # --- Cursor / etag advance --------------------------------------------
     # Only advance the single shared cursor once EVERY budget group this
@@ -298,6 +355,8 @@ def run_once(
             last_error=(f"poll failed for text_budget(s): {failed_budgets}" if any_failed else None),
             feed_reachable=not any_failed,
             sent_counts=dict(Counter(name for name, _ann_id in state.sent)),
+            pending_counts={name: len(items) for name, items in state.pending.items() if items},
+            window_status={d.name: schedule.in_window(d, now) for d in config.destinations},
         )
 
     if retry_afters:

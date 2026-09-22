@@ -183,6 +183,77 @@ class TestBuildConfig(unittest.TestCase):
         self.assertEqual(config.destinations[1].net_ids, [])
 
 
+class TestSendWindowValidation(unittest.TestCase):
+    """send_after / send_before / timezone -- all optional, all absent by
+    default (see TestBuildConfig.test_builds_valid_config's destinations,
+    neither of which set any of these three)."""
+
+    def test_absent_fields_default_to_none(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        config = build_config(raw)
+        self.assertIsNone(config.destinations[0].send_after)
+        self.assertIsNone(config.destinations[0].send_before)
+        self.assertIsNone(config.destinations[0].timezone)
+
+    def test_valid_send_after_and_send_before_are_kept(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["send_after"] = "08:00"
+        raw["destinations"][0]["send_before"] = "22:00"
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].send_after, "08:00")
+        self.assertEqual(config.destinations[0].send_before, "22:00")
+
+    def test_valid_timezone_is_kept(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["timezone"] = "America/Boise"
+        config = build_config(raw)
+        self.assertEqual(config.destinations[0].timezone, "America/Boise")
+
+    def test_send_after_wrong_format_raises_naming_destination_and_field(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["send_after"] = "8am"
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("send_after", str(ctx.exception))
+
+    def test_send_before_out_of_range_hour_raises(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["send_before"] = "24:00"
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("send_before", str(ctx.exception))
+
+    def test_send_after_out_of_range_minute_raises(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["send_after"] = "08:60"
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("send_after", str(ctx.exception))
+
+    def test_send_after_not_a_string_raises(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["send_after"] = 800
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("send_after", str(ctx.exception))
+
+    def test_invalid_timezone_raises_naming_destination(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["timezone"] = "Mars/Cydonia"
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("mwmesh-mc", str(ctx.exception))
+        self.assertIn("timezone", str(ctx.exception))
+
+    def test_empty_string_timezone_raises(self):
+        raw = parse_yaml_subset(EXAMPLE_YAML)
+        raw["destinations"][0]["timezone"] = ""
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(raw)
+        self.assertIn("timezone", str(ctx.exception))
+
+
 class TestMultiBudgetWarning(unittest.TestCase):
     """BUG 1's rate-limit consequence: config.py must warn (not error) when
     a config has more than one distinct text_budget and no feed.api_key --

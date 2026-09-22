@@ -38,8 +38,10 @@ rather than silently guessing at a value.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("meshwars_bot.config")
 
@@ -242,6 +244,11 @@ KNOWN_BOARDS = set(_BOARD_ALIASES)
 # set (honestly) if the feed grows more kinds.
 KNOWN_KINDS = {"daily_recap", "weekly_recap", "month_honors", "net_wrapup"}
 
+# Strict 24h "HH:MM" -- hours 00-23, minutes 00-59. Used to validate the
+# optional per-destination send_after/send_before window bounds (see
+# schedule.py, which interprets these once validated).
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
 DEFAULT_TEXT_BUDGET = 150
 MIN_TEXT_BUDGET = 20
 MAX_TEXT_BUDGET = 1000
@@ -281,6 +288,15 @@ class Destination:
     text_budget: int
     kinds: List[str] = field(default_factory=list)
     net_ids: List[int] = field(default_factory=list)
+    # Optional per-destination send window -- see schedule.py. All three
+    # absent (the default) means exactly today's behaviour: relay
+    # immediately, no holding. send_after/send_before are validated,
+    # already-normalized "HH:MM" strings (or None); timezone is a
+    # validated IANA zone name (or None -- meaning "host local time" at
+    # send time, resolved in schedule.py, not here).
+    send_after: Optional[str] = None
+    send_before: Optional[str] = None
+    timezone: Optional[str] = None
 
 
 @dataclass
@@ -375,6 +391,10 @@ def _build_destination(raw: Dict[str, Any], index: int) -> Destination:
         except (TypeError, ValueError):
             raise ConfigError(f"destination '{name}': 'port' must be an integer")
 
+    send_after = _validate_hhmm(raw.get("send_after"), name, "send_after")
+    send_before = _validate_hhmm(raw.get("send_before"), name, "send_before")
+    timezone = _validate_timezone(raw.get("timezone"), name)
+
     return Destination(
         name=name,
         transport=transport,
@@ -386,7 +406,43 @@ def _build_destination(raw: Dict[str, Any], index: int) -> Destination:
         text_budget=text_budget,
         kinds=list(kinds),
         net_ids=list(net_ids),
+        send_after=send_after,
+        send_before=send_before,
+        timezone=timezone,
     )
+
+
+def _validate_hhmm(value: Any, dest_name: str, field_name: str) -> Optional[str]:
+    """Validate an optional `send_after`/`send_before` value: None (absent)
+    passes through unchanged; anything else must be a strict 24h "HH:MM"
+    string, else ConfigError naming both the destination and the field."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _HHMM_RE.match(value.strip()):
+        raise ConfigError(
+            f"destination '{dest_name}': '{field_name}' must be a 24h \"HH:MM\" "
+            f"string (e.g. \"08:00\"), got {value!r}"
+        )
+    return value.strip()
+
+
+def _validate_timezone(value: Any, dest_name: str) -> Optional[str]:
+    """Validate an optional `timezone` value: None (absent) passes through
+    unchanged -- schedule.py falls back to the host's local timezone at
+    send time. Anything else must be a real IANA zone name accepted by
+    zoneinfo.ZoneInfo, else ConfigError naming the destination."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"destination '{dest_name}': 'timezone' must be a non-empty string")
+    tz = value.strip()
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+        raise ConfigError(
+            f"destination '{dest_name}': 'timezone' {tz!r} is not a valid IANA zone name: {e}"
+        )
+    return tz
 
 
 def multi_budget_warning_info(

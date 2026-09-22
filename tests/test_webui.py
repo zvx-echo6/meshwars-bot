@@ -121,6 +121,18 @@ class TestGetConfig(WebUITestCase):
         self.assertIn("dryrun", data["schema"]["transports"])
         self.assertIn("daily_recap", data["schema"]["kinds"])
 
+    def test_destination_json_includes_send_window_fields(self):
+        status, data = self.get_json("/api/config")
+        self.assertEqual(status, 200)
+        dest = data["destinations"][0]
+        self.assertIn("send_after", dest)
+        self.assertIn("send_before", dest)
+        self.assertIn("timezone", dest)
+        # config.example.yaml's destination doesn't set any of these.
+        self.assertIsNone(dest["send_after"])
+        self.assertIsNone(dest["send_before"])
+        self.assertIsNone(dest["timezone"])
+
     def test_invalid_config_on_disk_returns_500_not_a_crash(self):
         with open(self.config_path, "w", encoding="utf-8") as f:
             f.write("feed:\n\tbase_url: \"x\"\n")  # tab indentation -- a parse error
@@ -158,6 +170,33 @@ class TestPostConfig(WebUITestCase):
 
         status2, data2 = self.get_json("/api/config")
         self.assertEqual(data2["feed"]["base_url"], "https://changed.example")
+
+    def test_valid_send_window_fields_save_and_are_reflected_by_get(self):
+        payload = {
+            "destinations": [
+                self._valid_destination(
+                    send_after="08:00", send_before="22:00", timezone="America/Boise"
+                )
+            ],
+        }
+        status, data = self.post_json("/api/config", payload)
+        self.assertEqual(status, 200)
+        dest = data["destinations"][0]
+        self.assertEqual(dest["send_after"], "08:00")
+        self.assertEqual(dest["send_before"], "22:00")
+        self.assertEqual(dest["timezone"], "America/Boise")
+
+    def test_invalid_send_after_returns_400_and_names_field(self):
+        payload = {"destinations": [self._valid_destination(send_after="not-a-time")]}
+        status, data = self.post_json("/api/config", payload)
+        self.assertEqual(status, 400)
+        self.assertIn("send_after", data["error"])
+
+    def test_invalid_timezone_returns_400_and_names_field(self):
+        payload = {"destinations": [self._valid_destination(timezone="Not/AZone")]}
+        status, data = self.post_json("/api/config", payload)
+        self.assertEqual(status, 400)
+        self.assertIn("timezone", data["error"])
 
     def test_invalid_destination_returns_400_and_names_field_and_destination(self):
         before = self.read_config_raw()
@@ -238,6 +277,8 @@ class TestGetState(WebUITestCase):
         self.assertIsNone(data["last_poll_at"])
         self.assertIsNone(data["feed_reachable"])
         self.assertEqual(data["sent_counts"], {})
+        self.assertEqual(data["pending_counts"], {})
+        self.assertEqual(data["window_status"], {})
 
     def test_reflects_status_updates(self):
         self.status.update(
@@ -248,6 +289,15 @@ class TestGetState(WebUITestCase):
         self.assertEqual(data["cursor_since"], 42)
         self.assertTrue(data["feed_reachable"])
         self.assertEqual(data["sent_counts"], {"mwmesh-mc": 3})
+
+    def test_reflects_pending_and_window_status_updates(self):
+        self.status.update(
+            pending_counts={"mwmesh-mc": 2},
+            window_status={"mwmesh-mc": False},
+        )
+        status, data = self.get_json("/api/state")
+        self.assertEqual(data["pending_counts"], {"mwmesh-mc": 2})
+        self.assertEqual(data["window_status"], {"mwmesh-mc": False})
 
 
 class TestGetLog(WebUITestCase):

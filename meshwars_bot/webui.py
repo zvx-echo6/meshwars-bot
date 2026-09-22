@@ -70,6 +70,14 @@ class BotStatus:
             "last_error": None,
             "feed_reachable": None,
             "sent_counts": {},
+            # Per-destination counts of items currently held in the durable
+            # pending queue (see state.py's State.pending / main.py's drain
+            # phase), and whether each destination is, right now, inside
+            # its configured send window (always True for a destination
+            # with no window configured). Both keyed by destination name;
+            # empty until the first run_once() cycle updates them.
+            "pending_counts": {},
+            "window_status": {},
             # False until the bot's very first successful fast-forward poll
             # establishes a starting cursor. Until then the poll loop
             # relays NOTHING to any destination, however many cycles it
@@ -106,6 +114,9 @@ def _destination_to_json(d: Destination) -> Dict[str, Any]:
         "text_budget": d.text_budget,
         "kinds": list(d.kinds),
         "net_ids": list(d.net_ids),
+        "send_after": d.send_after,
+        "send_before": d.send_before,
+        "timezone": d.timezone,
     }
 
 
@@ -524,6 +535,7 @@ INDEX_HTML = """<!doctype html>
       <tr><td class="k">Last poll</td><td id="st-lastpoll">-</td></tr>
       <tr><td class="k">Last error</td><td id="st-lasterror">-</td></tr>
       <tr><td class="k">Sent counts</td><td id="st-sentcounts">-</td></tr>
+      <tr><td class="k">Pending / window</td><td id="st-pending">-</td></tr>
     </table>
   </section>
 
@@ -640,7 +652,7 @@ INDEX_HTML = """<!doctype html>
     dest = dest || {
       name: "", transport: schema.transports[0] || "dryrun", host: "", port: "",
       channel: "", board: schema.boards[0] || "mc", dry_run: true, text_budget: 150,
-      kinds: [], net_ids: []
+      kinds: [], net_ids: [], send_after: "", send_before: "", timezone: ""
     };
 
     var card = document.createElement("div");
@@ -693,6 +705,25 @@ INDEX_HTML = """<!doctype html>
     safety.appendChild(safetyLabel);
     refreshSafety();
     card.appendChild(safety);
+
+    // Send window (optional) -- holding is purely local to this bot; the
+    // feed itself has no concept of it.
+    var windowWrap = document.createElement("div");
+    var windowLabel = document.createElement("label");
+    windowLabel.textContent = "send window (optional -- blank send_after and send_before means relay immediately, as today)";
+    windowWrap.appendChild(windowLabel);
+    var windowRow = document.createElement("div");
+    windowRow.className = "row";
+    windowRow.style.marginTop = "4px";
+    windowRow.appendChild(fieldText("send_after", "send_after", dest.send_after));
+    windowRow.appendChild(fieldText("send_before", "send_before", dest.send_before));
+    windowRow.appendChild(fieldText("timezone", "timezone", dest.timezone));
+    windowWrap.appendChild(windowRow);
+    var windowHint = document.createElement("p");
+    windowHint.className = "hint";
+    windowHint.textContent = "send_after / send_before: 24h \"HH:MM\", e.g. \"08:00\" / \"22:00\" -- a window may wrap midnight (send_after later than send_before). timezone: IANA name, e.g. \"America/Boise\" -- blank uses the bot host's own local time. An announcement arriving outside the window is held and relayed at the first poll once inside it.";
+    windowWrap.appendChild(windowHint);
+    card.appendChild(windowWrap);
 
     // Kinds
     var kindsWrap = document.createElement("div");
@@ -851,7 +882,10 @@ INDEX_HTML = """<!doctype html>
         dry_run: card.querySelector('[data-field="dry_run"]').checked,
         text_budget: parseInt(val("text_budget") || "150", 10),
         kinds: kinds,
-        net_ids: netIds
+        net_ids: netIds,
+        send_after: val("send_after") ? val("send_after").trim() || null : null,
+        send_before: val("send_before") ? val("send_before").trim() || null : null,
+        timezone: val("timezone") ? val("timezone").trim() || null : null
       });
     });
     return out;
@@ -887,6 +921,18 @@ INDEX_HTML = """<!doctype html>
       qs("st-sentcounts").textContent = keys.length
         ? keys.map(function (k) { return k + ": " + counts[k]; }).join(", ")
         : "(none sent yet)";
+
+      var pendingCounts = st.pending_counts || {};
+      var windowStatus = st.window_status || {};
+      var destNames = Object.keys(windowStatus);
+      qs("st-pending").textContent = destNames.length
+        ? destNames.map(function (n) {
+            var count = pendingCounts[n] || 0;
+            var inWindow = windowStatus[n];
+            return n + ": " + count + " pending, " + (inWindow ? "in window" : "outside window");
+          }).join("; ")
+        : "(no destinations)";
+
       var reach = qs("st-reachable");
       if (st.feed_reachable === true) { reach.innerHTML = '<span class="pill up">reachable</span>'; }
       else if (st.feed_reachable === false) { reach.innerHTML = '<span class="pill down">unreachable</span>'; }

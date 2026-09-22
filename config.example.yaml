@@ -82,3 +82,19 @@ destinations:
     # wildcard that defaults to "all nets" when left empty. List the net
     # IDs you actually want (e.g. [1, 2]) to receive their announcements.
     net_ids: [1]
+
+    # Optional per-destination send window, in local time. The feed
+    # publishes an announcement the moment its period closes -- correct
+    # for a public feed shared across meshes in other timezones, but a
+    # strange hour to key up a radio. If send_after/send_before are BOTH
+    # absent (the default), behaviour is unchanged: relay immediately.
+    # When set, an announcement arriving outside the window is held
+    # (durably -- it survives a bot restart) and relayed at the first poll
+    # that falls inside the window. A window may wrap midnight, e.g.
+    # send_after: "22:00" / send_before: "06:00".
+    # send_after: "08:00"
+    # send_before: "22:00"
+
+    # IANA zone name send_after/send_before are interpreted in. Absent
+    # defaults to the bot host's own local timezone.
+    # timezone: "America/Boise"

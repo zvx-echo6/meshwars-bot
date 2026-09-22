@@ -112,6 +112,26 @@ class TestRoundTrip(unittest.TestCase):
         }
         self._assert_round_trips(raw)
 
+    def test_send_window_fields_round_trip(self):
+        raw = {
+            "destinations": [
+                {
+                    "name": "d1",
+                    "send_after": "08:00",
+                    "send_before": "22:00",
+                    "timezone": "America/Boise",
+                }
+            ]
+        }
+        self._assert_round_trips(raw)
+
+    def test_send_window_fields_absent_stay_absent(self):
+        raw = {"destinations": [{"name": "d1", "dry_run": True}]}
+        text = write_config_text(raw)
+        self.assertNotIn("    send_after:", text)
+        self.assertNotIn("    send_before:", text)
+        self.assertNotIn("    timezone:", text)
+
 
 class TestUnsafeValues(unittest.TestCase):
     def test_double_quote_in_value_raises(self):

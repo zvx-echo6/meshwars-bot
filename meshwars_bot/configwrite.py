@@ -154,6 +154,15 @@ _DESTINATIONS_HEADER_COMMENT = [
     "net_ids: explicit allow-list of net IDs whose net-tied announcements are",
     "  relayed here. EMPTY ([]) means NO net announcements reach this",
     "  destination -- opt-in, not a wildcard.",
+    "send_after / send_before: optional 24h \"HH:MM\" send window, in local",
+    "  time. Both absent (the default) means relay immediately, exactly as",
+    "  before. An announcement arriving outside the window is held (durably",
+    "  -- it survives a restart) and relayed at the first poll that falls",
+    "  inside the window. A window may wrap midnight (send_after later than",
+    "  send_before, e.g. \"22:00\"/\"06:00\").",
+    "timezone: IANA zone name (e.g. \"America/Boise\") send_after/send_before",
+    "  are interpreted in. Absent -- defaults to the bot host's own local",
+    "  timezone.",
 ]
 
 # Destination field order, matching config.example.yaml, with a short
@@ -170,6 +179,9 @@ _DESTINATION_FIELD_ORDER = [
     ("text_budget", "bytes, clamped 20-1000"),
     ("kinds", "announcement kinds relayed here"),
     ("net_ids", "opt-in net allow-list -- [] means no net announcements"),
+    ("send_after", "HH:MM 24h -- hold until this local time; absent = relay immediately"),
+    ("send_before", "HH:MM 24h -- hold after this local time"),
+    ("timezone", "IANA zone for send_after/send_before; absent = host local time"),
 ]
 
 
